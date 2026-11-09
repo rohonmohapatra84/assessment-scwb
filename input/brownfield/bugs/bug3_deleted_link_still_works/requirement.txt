@@ -1,0 +1,1 @@
+Fix the bug where a short link that has been deleted still redirects and still returns its details. After a link is deleted, visiting the short URL and requesting the link's metadata must both return 404.

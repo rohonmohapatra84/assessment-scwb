@@ -5,6 +5,7 @@ Every scenario reads its INPUT from input/<scenario>/requirement.txt and writes 
 
   python run.py demo                       # greenfield + brownfield bug fix + ambiguous, end to end
   python run.py greenfield                 # mandatory URL-shortener use case
+  python run.py greenfield --shorten URL   # build the service with the agents, then shorten YOUR URL with it (--alias NAME; stays up for the browser, --once to stop)
   python run.py brownfield                 # BUG FIX: plant a bug in a copy of the shortener, then fix it (your first brownfield test)
   python run.py enhancement                # add link expiry (changes the API; may amend an obsolete test with human approval)
   python run.py refactor                   # behaviour-preserving restructuring
@@ -259,9 +260,33 @@ def main() -> int:
     p.add_argument("--verify", action="store_true",
                    help="after a scenario, re-check the run from disk and re-run the release's own tests, then print one verdict")
     p.add_argument("--requirement-file", help="use this requirement text file instead of input/<scenario>/requirement.txt")
+    p.add_argument("--shorten", action="append", default=[], metavar="URL",
+                   help="greenfield only: after the agents build and release the service, shorten this URL with it (repeatable)")
+    p.add_argument("--alias", help="with --shorten: a custom alias for the first URL (3-32 letters, digits, _ or -)")
+    p.add_argument("--once", action="store_true",
+                   help="with --shorten: stop the service right after shortening. Default: it keeps running so the short URL opens in a browser (Ctrl+C stops it)")
     args = p.parse_args()
     if args.scenario == "custom" and not args.text:
         p.error("custom requires the requirement text")
+    if (args.shorten or args.alias or args.once) and args.scenario != "greenfield":
+        p.error("--shorten, --alias and --once only work with the greenfield scenario")
+    if (args.alias or args.once) and not args.shorten:
+        p.error("--alias and --once need --shorten <URL>")
+
+    def shorten_with_built_service(result: RunResult, a) -> int:
+        """The user's own URL, shortened by the service the agents just built and the validator and human gate released."""
+        banner("SHORTEN YOUR URL with the service the agents just built")
+        if not result.ok or not (result.out_dir / "release" / "shortener" / "server.py").exists():
+            print(f"no released service to use (status: {result.status}); nothing was shortened. See {result.out_dir / 'RUN_STORY.md'}.")
+            return 1
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import shorten_url
+        argv = list(a.shorten) + ["--service-dir", str(result.out_dir / "release")]
+        if a.alias:
+            argv += ["--alias", a.alias]
+        if a.once:
+            argv.append("--once")
+        return shorten_url.main(argv)
 
     def with_verify(key, runner):
         def go(a):
@@ -269,6 +294,8 @@ def main() -> int:
             code = report(result)
             if a.verify:
                 code = max(code, verify_run(key, result) if result.ok else 1)
+            if key == "greenfield" and a.shorten:
+                code = max(code, shorten_with_built_service(result, a))
             return code
         return go
     return {"demo": demo, "greenfield": with_verify("greenfield", run_greenfield), "brownfield": with_verify("brownfield", run_brownfield),

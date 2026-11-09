@@ -1,0 +1,1 @@
+Fix the bug where the link stats endpoint accepts a days value above 90 (for example days=365). The days parameter must be between 1 and 90, and anything outside that range must be rejected with a 400 error.

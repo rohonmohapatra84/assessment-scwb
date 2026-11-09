@@ -1,0 +1,1 @@
+Fix the bug where the alias "admin" can be registered as a custom alias for a short link. Reserved names such as "admin" must be rejected with a 400 error.

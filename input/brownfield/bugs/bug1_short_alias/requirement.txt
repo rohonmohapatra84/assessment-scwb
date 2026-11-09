@@ -1,0 +1,1 @@
+Fix the bug where a custom alias shorter than 3 characters (for example "ab") is accepted when creating a short link. Aliases must be 3 to 32 characters long, and shorter ones must be rejected with a 400 error.
