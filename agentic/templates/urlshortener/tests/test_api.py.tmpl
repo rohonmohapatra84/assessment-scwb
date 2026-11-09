@@ -1,0 +1,160 @@
+"""Integration tests: the full WSGI stack (routing, auth, rate limit, service, SQLite)."""
+import unittest
+
+from .helpers import make_app
+
+
+def create(client, url="https://example.com/landing", **extra):
+    return client.request("POST", "/api/v1/links", {"url": url, **extra})
+
+
+class CreateLinkTests(unittest.TestCase):
+    def setUp(self):
+        self.app, self.service, self.clock, self.client = make_app()
+
+    def test_create_returns_201_with_location(self):
+        r = create(self.client)
+        self.assertEqual(r.status, 201)
+        body = r.json()
+        self.assertEqual(len(body["code"]), 7)
+        self.assertEqual(body["short_url"], f"http://localhost:8080/{body['code']}")
+        self.assertEqual(r.headers["location"], f"/api/v1/links/{body['code']}")
+
+    def test_custom_alias_then_conflict(self):
+        self.assertEqual(create(self.client, custom_alias="promo-1").status, 201)
+        r = create(self.client, custom_alias="promo-1")
+        self.assertEqual(r.status, 409)
+        self.assertEqual(r.json()["error"]["code"], "alias_taken")
+
+    def test_validation_errors_are_400_with_json_body(self):
+        for payload in ({"url": "ftp://x.example"}, {"url": "http://127.0.0.1/"}, {}, {"url": "https://a.example", "custom_alias": "x"}):
+            with self.subTest(payload=payload):
+                r = self.client.request("POST", "/api/v1/links", payload)
+                self.assertEqual(r.status, 400)
+                self.assertIn("code", r.json()["error"])
+
+    def test_malformed_and_oversized_bodies(self):
+        self.assertEqual(self.client.request("POST", "/api/v1/links", raw_body=b"{not json").status, 400)
+        self.assertEqual(self.client.request("POST", "/api/v1/links", raw_body=b"[1,2]").status, 400)
+        self.assertEqual(self.client.request("POST", "/api/v1/links").status, 400)
+        self.assertEqual(self.client.request("POST", "/api/v1/links", raw_body=b"x" * 20000).status, 400)
+
+    def test_wrong_method_is_405(self):
+        r = self.client.request("PUT", "/api/v1/links")
+        self.assertEqual(r.status, 405)
+
+    def test_unknown_route_is_404(self):
+        self.assertEqual(self.client.request("GET", "/api/v1/nothing/here").status, 404)
+
+
+class RedirectTests(unittest.TestCase):
+    def setUp(self):
+        self.app, self.service, self.clock, self.client = make_app()
+
+    def test_redirect_302_and_location(self):
+        code = create(self.client, "https://example.com/a?b=1").json()["code"]
+        r = self.client.request("GET", f"/{code}")
+        self.assertEqual(r.status, 302)
+        self.assertEqual(r.headers["location"], "https://example.com/a?b=1")
+
+    def test_unknown_code_404_json(self):
+        r = self.client.request("GET", "/doesnotexist")
+        self.assertEqual(r.status, 404)
+        self.assertEqual(r.json()["error"]["code"], "link_not_found")
+
+    def test_deleted_link_404(self):
+        code = create(self.client).json()["code"]
+        self.assertEqual(self.client.request("DELETE", f"/api/v1/links/{code}").status, 204)
+        self.assertEqual(self.client.request("GET", f"/{code}").status, 404)
+        self.assertEqual(self.client.request("DELETE", f"/api/v1/links/{code}").status, 404)
+
+    def test_reserved_paths_are_not_swallowed_by_code_route(self):
+        self.assertEqual(self.client.request("GET", "/healthz").status, 200)
+        self.assertEqual(self.client.request("GET", "/openapi.json").status, 200)
+
+
+class MetadataAndStatsTests(unittest.TestCase):
+    def setUp(self):
+        self.app, self.service, self.clock, self.client = make_app()
+
+    def test_get_metadata(self):
+        code = create(self.client).json()["code"]
+        r = self.client.request("GET", f"/api/v1/links/{code}")
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.json()["long_url"], "https://example.com/landing")
+        self.assertEqual(self.client.request("GET", "/api/v1/links/missing1").status, 404)
+
+    def test_stats_after_clicks(self):
+        code = create(self.client).json()["code"]
+        self.client.request("GET", f"/{code}", ip="198.51.100.1", headers={"User-Agent": "Mozilla/5.0 (iPhone) Mobile", "Referer": "https://news.example"})
+        self.client.request("GET", f"/{code}", ip="198.51.100.1", headers={"User-Agent": "Mozilla/5.0 (iPhone) Mobile"})
+        self.client.request("GET", f"/{code}", ip="198.51.100.2", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0)"})
+        self.service.recorder.flush()  # analytics are eventually consistent (ADR-004)
+        r = self.client.request("GET", f"/api/v1/links/{code}/stats?days=7")
+        self.assertEqual(r.status, 200)
+        s = r.json()
+        self.assertEqual((s["total_clicks"], s["unique_visitors"]), (3, 2))
+        self.assertEqual({d["device"]: d["clicks"] for d in s["devices"]}, {"mobile": 2, "desktop": 1})
+        self.assertEqual(s["clicks_by_day"], [{"day": "2026-01-01", "clicks": 3}])
+
+    def test_stats_validation(self):
+        code = create(self.client).json()["code"]
+        self.assertEqual(self.client.request("GET", f"/api/v1/links/{code}/stats?days=abc").status, 400)
+        self.assertEqual(self.client.request("GET", f"/api/v1/links/{code}/stats?days=500").status, 400)
+        self.assertEqual(self.client.request("GET", "/api/v1/links/missing1/stats").status, 404)
+
+
+class OperationalTests(unittest.TestCase):
+    def test_healthz(self):
+        _, _, _, client = make_app()
+        r = client.request("GET", "/healthz")
+        self.assertEqual((r.status, r.json()), (200, {"status": "ok"}))
+
+    def test_healthz_reports_datastore_failure(self):
+        app, service, _, client = make_app()
+        service.repo.close()
+        self.assertEqual(client.request("GET", "/healthz").status, 503)
+
+    def test_rate_limit(self):
+        _, _, _, client = make_app(rate_limit_per_minute=2)
+        statuses = [create(client).status for _ in range(3)]
+        self.assertEqual(statuses, [201, 201, 429])
+        self.assertEqual(create(client).json()["error"]["code"], "rate_limited")
+        # a different client is unaffected
+        self.assertEqual(client.request("POST", "/api/v1/links", {"url": "https://example.com"}, ip="203.0.113.50").status, 201)
+
+    def test_api_key_required_when_configured(self):
+        _, _, _, client = make_app(api_keys=("k-123456",))
+        self.assertEqual(create(client).status, 401)
+        r = client.request("POST", "/api/v1/links", {"url": "https://example.com"}, headers={"X-API-Key": "wrong"})
+        self.assertEqual(r.status, 401)
+        r = client.request("POST", "/api/v1/links", {"url": "https://example.com"}, headers={"X-API-Key": "k-123456"})
+        self.assertEqual(r.status, 201)
+        code = r.json()["code"]
+        self.assertEqual(client.request("GET", f"/{code}").status, 302)  # redirects stay public
+
+    def test_security_and_trace_headers(self):
+        _, _, _, client = make_app()
+        r = client.request("GET", "/healthz")
+        self.assertEqual(r.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(len(r.headers["x-request-id"]), 16)
+
+    def test_internal_errors_do_not_leak(self):
+        app, service, _, client = make_app()
+
+        def boom(*a, **k):
+            raise RuntimeError("secret internal detail")
+        service.create_link = boom
+        r = create(client)
+        self.assertEqual(r.status, 500)
+        self.assertNotIn("secret", r.body.decode())
+
+    def test_forwarded_header_ignored_unless_trusted(self):
+        _, _, _, client = make_app(rate_limit_per_minute=1)
+        self.assertEqual(client.request("POST", "/api/v1/links", {"url": "https://example.com"}, headers={"X-Forwarded-For": "1.1.1.1"}).status, 201)
+        # spoofed XFF must not grant a fresh bucket
+        self.assertEqual(client.request("POST", "/api/v1/links", {"url": "https://example.com"}, headers={"X-Forwarded-For": "2.2.2.2"}).status, 429)
+
+
+if __name__ == "__main__":
+    unittest.main()

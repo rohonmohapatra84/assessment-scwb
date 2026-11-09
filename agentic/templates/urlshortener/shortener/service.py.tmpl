@@ -1,0 +1,90 @@
+"""Business logic. Pure orchestration of validation, storage, cache and analytics;
+no HTTP and no SQL here, which keeps it unit-testable with fakes."""
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, Optional
+
+from .analytics import ClickRecorder, classify_device, visitor_hash
+from .cache import TTLCache
+from .codec import generate_code
+from .config import Config
+from .errors import AliasTaken, BadRequest, LinkNotFound, ShortenerError
+from .models import ClickEvent, Link, Visitor
+from .storage import Repository
+from .validation import RESERVED_ALIASES, validate_alias, validate_url
+
+MAX_CODE_ATTEMPTS = 5
+
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+class ShortenerService:
+    def __init__(self, repo: Repository, config: Config, recorder: Optional[ClickRecorder] = None,
+                 cache: Optional[TTLCache] = None, now: Optional[Callable[[], datetime]] = None,
+                 code_factory: Optional[Callable[[], str]] = None):
+        self.repo = repo
+        self.config = config
+        self.recorder = recorder
+        self.cache = cache or TTLCache(config.cache_size, config.cache_ttl_seconds)
+        self._now = now or (lambda: datetime.now(timezone.utc))
+        self._new_code = code_factory or (lambda: generate_code(config.code_length))
+
+    # ---------------------------------------------------------------- create
+    def create_link(self, url: Any, alias: Optional[str] = None) -> Link:
+        long_url = validate_url(url)
+        created_at = _iso(self._now())
+        if alias is not None:
+            return self.repo.create_link(validate_alias(alias), long_url, created_at)
+        for _ in range(MAX_CODE_ATTEMPTS):
+            code = self._new_code()
+            if code.lower() in RESERVED_ALIASES:
+                continue
+            try:
+                return self.repo.create_link(code, long_url, created_at)
+            except AliasTaken:
+                continue  # collision: retry with a fresh random code
+        raise ShortenerError("could not allocate a unique short code")
+
+    # ------------------------------------------------------------------ read
+    def _lookup(self, code: str) -> Link:
+        link = self.cache.get(code)
+        if link is None:
+            link = self.repo.get_link(code)
+            if link is None:
+                raise LinkNotFound(f"no link for code '{code}'")
+            self.cache.put(code, link)
+        return link
+
+    def get_link(self, code: str) -> Link:
+        return self._lookup(code)
+
+    def resolve(self, code: str, visitor: Visitor) -> str:
+        link = self._lookup(code)
+        if self.recorder is not None:
+            self.recorder.record(ClickEvent(
+                code=code,
+                ts=_iso(self._now()),
+                visitor_hash=visitor_hash(visitor.ip, visitor.user_agent, self.config.visitor_salt),
+                referrer=visitor.referrer or None,
+                device=classify_device(visitor.user_agent),
+            ))
+        return link.long_url
+
+    # ---------------------------------------------------------------- delete
+    def delete_link(self, code: str) -> None:
+        deleted = self.repo.delete_link(code, _iso(self._now()))
+        self.cache.invalidate(code)
+        if not deleted:
+            raise LinkNotFound(f"no link for code '{code}'")
+
+    # ----------------------------------------------------------------- stats
+    def stats(self, code: str, days: int = 7) -> Dict[str, Any]:
+        if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 90:
+            raise BadRequest("days must be an integer between 1 and 90")
+        self._lookup(code)  # 404 for unknown codes
+        since = (self._now().astimezone(timezone.utc).date() - timedelta(days=days - 1)).isoformat()
+        data = self.repo.stats(code, since)
+        return {"code": code, "window_days": days, **data}

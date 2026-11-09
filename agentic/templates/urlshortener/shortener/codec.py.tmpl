@@ -1,0 +1,41 @@
+"""Base62 helpers and short-code generation (ADR-001)."""
+from __future__ import annotations
+
+import secrets
+import string
+
+ALPHABET = string.digits + string.ascii_uppercase + string.ascii_lowercase  # 62 symbols
+_INDEX = {c: i for i, c in enumerate(ALPHABET)}
+
+
+def encode_base62(n: int) -> str:
+    if n < 0:
+        raise ValueError("n must be >= 0")
+    if n == 0:
+        return ALPHABET[0]
+    out = []
+    while n:
+        n, rem = divmod(n, 62)
+        out.append(ALPHABET[rem])
+    return "".join(reversed(out))
+
+
+def decode_base62(s: str) -> int:
+    n = 0
+    for ch in s:
+        try:
+            n = n * 62 + _INDEX[ch]
+        except KeyError:
+            raise ValueError(f"invalid base62 character {ch!r}") from None
+    return n
+
+
+def generate_code(length: int = {{CODE_LENGTH}}) -> str:
+    """Cryptographically random, non-enumerable code.
+
+    Space is 62**length (3.5e12 for 7). Per-insert collision probability at n
+    stored links is ~n/62**length, handled by a unique-constraint retry.
+    """
+    if length < 4:
+        raise ValueError("length must be >= 4")
+    return "".join(secrets.choice(ALPHABET) for _ in range(length))

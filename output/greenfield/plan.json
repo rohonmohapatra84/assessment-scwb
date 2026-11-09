@@ -1,0 +1,242 @@
+{
+  "plan_type": "greenfield",
+  "rationale": "Establish the architecture first, then design the API contract and persistence schema in parallel. Implementation proceeds alongside risk-driven verification planning; independent tests and documentation feed a final quality gate and evidence summary.",
+  "waves": [
+    [
+      "design_architecture"
+    ],
+    [
+      "design_contract",
+      "design_schema"
+    ],
+    [
+      "assess_risks",
+      "implement_service"
+    ],
+    [
+      "plan_validation"
+    ],
+    [
+      "write_documentation",
+      "write_spec_tests"
+    ],
+    [
+      "validate_delivery"
+    ],
+    [
+      "summarize_evidence"
+    ]
+  ],
+  "tasks": [
+    {
+      "id": "design_architecture",
+      "title": "Design scalable service architecture",
+      "agent": "architect",
+      "deps": [],
+      "description": "Decide the architecture: components, data flows, capacity model, architecture decision records.",
+      "writes": [],
+      "optional": false,
+      "repair_targets": [],
+      "max_attempts": 3,
+      "status": "pending",
+      "attempts": 0,
+      "error": null,
+      "started_at": null,
+      "ended_at": null,
+      "generation": 0
+    },
+    {
+      "id": "design_contract",
+      "title": "Define contract-first OpenAPI routes",
+      "agent": "contract_designer",
+      "deps": [
+        "design_architecture"
+      ],
+      "description": "Publish the OpenAPI contract (openapi.json). Code, tests and docs all build on it.",
+      "writes": [
+        "openapi.json"
+      ],
+      "optional": false,
+      "repair_targets": [],
+      "max_attempts": 3,
+      "status": "pending",
+      "attempts": 0,
+      "error": null,
+      "started_at": null,
+      "ended_at": null,
+      "generation": 0
+    },
+    {
+      "id": "design_schema",
+      "title": "Define durable link and analytics schema",
+      "agent": "data_modeler",
+      "deps": [
+        "design_architecture"
+      ],
+      "description": "Define the relational schema (schema.sql).",
+      "writes": [
+        "schema.sql"
+      ],
+      "optional": false,
+      "repair_targets": [],
+      "max_attempts": 3,
+      "status": "pending",
+      "attempts": 0,
+      "error": null,
+      "started_at": null,
+      "ended_at": null,
+      "generation": 0
+    },
+    {
+      "id": "assess_risks",
+      "title": "Assess scalability, abuse, and durability risks",
+      "agent": "risk_assessor",
+      "deps": [
+        "design_contract",
+        "design_schema"
+      ],
+      "description": "List risks, failure scenarios and mitigations for the work in hand.",
+      "writes": [],
+      "optional": false,
+      "repair_targets": [],
+      "max_attempts": 3,
+      "status": "pending",
+      "attempts": 0,
+      "error": null,
+      "started_at": null,
+      "ended_at": null,
+      "generation": 0
+    },
+    {
+      "id": "plan_validation",
+      "title": "Define risk-driven acceptance verification",
+      "agent": "validation_strategist",
+      "deps": [
+        "assess_risks"
+      ],
+      "description": "Define the test strategy and verification steps, derived from the risks, before any test is written.",
+      "writes": [],
+      "optional": false,
+      "repair_targets": [],
+      "max_attempts": 3,
+      "status": "pending",
+      "attempts": 0,
+      "error": null,
+      "started_at": null,
+      "ended_at": null,
+      "generation": 0
+    },
+    {
+      "id": "implement_service",
+      "title": "Implement APIs, persistence, and asynchronous analytics",
+      "agent": "code_author",
+      "deps": [
+        "design_contract",
+        "design_schema"
+      ],
+      "description": "MODEL-BACKED agent: writes the service (greenfield) or proposes anchored edits to existing code (llm_change).",
+      "writes": [
+        "shortener/*",
+        "scripts/*",
+        "Dockerfile",
+        "pyproject.toml",
+        ".gitignore"
+      ],
+      "optional": false,
+      "repair_targets": [],
+      "max_attempts": 4,
+      "status": "pending",
+      "attempts": 0,
+      "error": null,
+      "started_at": null,
+      "ended_at": null,
+      "generation": 0
+    },
+    {
+      "id": "write_spec_tests",
+      "title": "Write independent specification and acceptance tests",
+      "agent": "spec_tester",
+      "deps": [
+        "plan_validation"
+      ],
+      "description": "MODEL-BACKED agent: writes tests from the specification only, never seeing the code (independent oracle).",
+      "writes": [
+        "tests/*"
+      ],
+      "optional": false,
+      "repair_targets": [],
+      "max_attempts": 4,
+      "status": "pending",
+      "attempts": 0,
+      "error": null,
+      "started_at": null,
+      "ended_at": null,
+      "generation": 0
+    },
+    {
+      "id": "write_documentation",
+      "title": "Document operation, architecture, and mitigations",
+      "agent": "doc_writer",
+      "deps": [
+        "plan_validation"
+      ],
+      "description": "Write the documentation: README, architecture, ADRs, risks (new system); change record and changelog (change); proposal (analysis).",
+      "writes": [
+        "README.md",
+        "docs/*"
+      ],
+      "optional": true,
+      "repair_targets": [],
+      "max_attempts": 3,
+      "status": "pending",
+      "attempts": 0,
+      "error": null,
+      "started_at": null,
+      "ended_at": null,
+      "generation": 0
+    },
+    {
+      "id": "validate_delivery",
+      "title": "Run quality gates and acceptance checks",
+      "agent": "validator",
+      "deps": [
+        "implement_service",
+        "write_spec_tests",
+        "write_documentation"
+      ],
+      "description": "The quality gate: runs static, contract, schema, test, regression and traceability checks. Blames producers by role.",
+      "writes": [],
+      "optional": false,
+      "repair_targets": [
+        "implement_service",
+        "write_spec_tests"
+      ],
+      "max_attempts": 3,
+      "status": "pending",
+      "attempts": 0,
+      "error": null,
+      "started_at": null,
+      "ended_at": null,
+      "generation": 0
+    },
+    {
+      "id": "summarize_evidence",
+      "title": "Summarize implementation and verification evidence",
+      "agent": "summarizer",
+      "deps": [
+        "validate_delivery"
+      ],
+      "description": "Aggregate the evidence for the engineering summary.",
+      "writes": [],
+      "optional": false,
+      "repair_targets": [],
+      "max_attempts": 3,
+      "status": "pending",
+      "attempts": 0,
+      "error": null,
+      "started_at": null,
+      "ended_at": null,
+      "generation": 0
+    }
+  ]
+}

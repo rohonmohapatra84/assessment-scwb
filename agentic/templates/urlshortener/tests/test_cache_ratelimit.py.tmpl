@@ -1,0 +1,77 @@
+import unittest
+
+from shortener.cache import TTLCache
+from shortener.ratelimit import TokenBucketLimiter
+
+
+class TTLCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.t = [0.0]
+        self.clock = lambda: self.t[0]
+
+    def test_hit_and_miss(self):
+        c = TTLCache(10, 60, self.clock)
+        self.assertIsNone(c.get("a"))
+        c.put("a", 1)
+        self.assertEqual(c.get("a"), 1)
+        self.assertEqual(c.stats(), {"size": 1, "hits": 1, "misses": 1})
+
+    def test_ttl_expiry(self):
+        c = TTLCache(10, 60, self.clock)
+        c.put("a", 1)
+        self.t[0] = 59.9
+        self.assertEqual(c.get("a"), 1)
+        self.t[0] = 60.0
+        self.assertIsNone(c.get("a"))
+
+    def test_lru_eviction(self):
+        c = TTLCache(2, 60, self.clock)
+        c.put("a", 1)
+        c.put("b", 2)
+        c.get("a")  # a is now most recent
+        c.put("c", 3)  # evicts b
+        self.assertIsNone(c.get("b"))
+        self.assertEqual(c.get("a"), 1)
+        self.assertEqual(c.get("c"), 3)
+
+    def test_invalidate(self):
+        c = TTLCache(2, 60, self.clock)
+        c.put("a", 1)
+        c.invalidate("a")
+        self.assertIsNone(c.get("a"))
+
+    def test_invalid_size(self):
+        with self.assertRaises(ValueError):
+            TTLCache(0, 1)
+
+
+class RateLimiterTests(unittest.TestCase):
+    def test_burst_then_block_then_refill(self):
+        t = [0.0]
+        lim = TokenBucketLimiter(60, clock=lambda: t[0])  # 1 token/sec, burst 60
+        self.assertTrue(all(lim.allow("ip") for _ in range(60)))
+        self.assertFalse(lim.allow("ip"))
+        t[0] += 2.0
+        self.assertTrue(lim.allow("ip"))
+        self.assertTrue(lim.allow("ip"))
+        self.assertFalse(lim.allow("ip"))
+
+    def test_keys_are_independent(self):
+        lim = TokenBucketLimiter(1, clock=lambda: 0.0)
+        self.assertTrue(lim.allow("a"))
+        self.assertFalse(lim.allow("a"))
+        self.assertTrue(lim.allow("b"))
+
+    def test_disabled_when_zero(self):
+        lim = TokenBucketLimiter(0)
+        self.assertTrue(all(lim.allow("x") for _ in range(1000)))
+
+    def test_memory_is_bounded(self):
+        lim = TokenBucketLimiter(10, clock=lambda: 0.0, max_keys=100)
+        for i in range(1000):
+            lim.allow(f"ip-{i}")
+        self.assertLessEqual(len(lim._buckets), 100)
+
+
+if __name__ == "__main__":
+    unittest.main()

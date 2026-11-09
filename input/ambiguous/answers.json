@@ -1,0 +1,4 @@
+{
+  "Q1": "Redirect path only: p95 server-side latency under 30 ms at 1,000 requests/second",
+  "Q2": "Threats in scope: link abuse and unauthenticated API writes. Require API keys on write endpoints and add per-key rate limiting. Phishing screening is a later phase."
+}

@@ -1,0 +1,101 @@
+"""Click analytics pipeline, kept OFF the redirect hot path (ADR-004, ADR-006).
+
+record() is O(1) and never blocks: it enqueues into a bounded queue. A
+background thread drains the queue in batches (one transaction per batch).
+Under overload events are dropped and counted rather than slowing redirects.
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import queue
+import re
+import threading
+from typing import List, Optional
+
+from .models import ClickEvent
+
+log = logging.getLogger("shortener.analytics")
+
+_BOT = re.compile(r"bot|crawler|spider|slurp|curl|wget|python-requests|httpclient|facebookexternalhit", re.I)
+_TABLET = re.compile(r"ipad|tablet", re.I)
+_MOBILE = re.compile(r"mobi|android|iphone", re.I)
+
+
+def classify_device(user_agent: str) -> str:
+    if not user_agent:
+        return "unknown"
+    if _BOT.search(user_agent):
+        return "bot"
+    if _TABLET.search(user_agent):
+        return "tablet"
+    if _MOBILE.search(user_agent):
+        return "mobile"
+    return "desktop"
+
+
+def visitor_hash(ip: str, user_agent: str, salt: str) -> str:
+    """Salted one-way hash: unique-visitor counting without storing the raw IP."""
+    return hashlib.sha256(f"{salt}|{ip}|{user_agent}".encode("utf-8")).hexdigest()[:16]
+
+
+class ClickRecorder:
+    def __init__(self, repo, flush_interval: float = 1.0, max_queue: int = 10_000, batch_size: int = 500):
+        self._repo = repo
+        self._interval = flush_interval
+        self._batch = batch_size
+        self._queue: "queue.Queue[ClickEvent]" = queue.Queue(maxsize=max_queue)
+        self._stop = threading.Event()
+        self._flush_lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self.dropped = 0
+        self.failed = 0
+
+    def record(self, event: ClickEvent) -> bool:
+        try:
+            self._queue.put_nowait(event)
+            return True
+        except queue.Full:
+            self.dropped += 1  # exposed for alerting; protects redirect latency
+            return False
+
+    def flush(self) -> int:
+        # Serialised: a manual flush must not return while the background thread still holds drained-but-unwritten
+        # events, otherwise read-your-writes (and the "synchronously persists" contract) is violated.
+        with self._flush_lock:
+            return self._flush_locked()
+
+    def _flush_locked(self) -> int:
+        total = 0
+        while True:
+            batch: List[ClickEvent] = []
+            try:
+                while len(batch) < self._batch:
+                    batch.append(self._queue.get_nowait())
+            except queue.Empty:
+                pass
+            if not batch:
+                return total
+            try:
+                self._repo.record_clicks(batch)
+            except Exception:  # analytics must never take the service down
+                self.failed += len(batch)
+                log.exception("failed to persist %d click events", len(batch))
+            total += len(batch)
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="click-flusher", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            self.flush()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+        self.flush()  # drain on shutdown so a clean stop loses nothing

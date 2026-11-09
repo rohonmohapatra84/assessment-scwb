@@ -1,0 +1,88 @@
+import unittest
+
+from shortener.analytics import ClickRecorder, classify_device, visitor_hash
+from shortener.models import ClickEvent
+from shortener.storage import Repository
+
+
+def event(i=0, code="abc"):
+    return ClickEvent(code=code, ts="2026-01-01T10:00:00+00:00", visitor_hash=f"v{i}", referrer=None, device="desktop")
+
+
+class DeviceTests(unittest.TestCase):
+    def test_classification(self):
+        cases = {
+            "": "unknown",
+            "Mozilla/5.0 (Windows NT 10.0) Chrome/120": "desktop",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17) Mobile": "mobile",
+            "Mozilla/5.0 (iPad; CPU OS 17)": "tablet",
+            "Googlebot/2.1 (+http://www.google.com/bot.html)": "bot",
+            "curl/8.4.0": "bot",
+        }
+        for ua, expected in cases.items():
+            with self.subTest(ua=ua):
+                self.assertEqual(classify_device(ua), expected)
+
+    def test_visitor_hash_is_stable_salted_and_not_the_ip(self):
+        a = visitor_hash("1.2.3.4", "UA", "salt1")
+        self.assertEqual(a, visitor_hash("1.2.3.4", "UA", "salt1"))
+        self.assertNotEqual(a, visitor_hash("1.2.3.4", "UA", "salt2"))
+        self.assertNotEqual(a, visitor_hash("1.2.3.5", "UA", "salt1"))
+        self.assertNotIn("1.2.3.4", a)
+
+
+class RecorderTests(unittest.TestCase):
+    def test_flush_batches_into_repository(self):
+        repo = Repository(":memory:")
+        rec = ClickRecorder(repo, batch_size=2)
+        for i in range(5):
+            self.assertTrue(rec.record(event(i)))
+        self.assertEqual(rec.flush(), 5)
+        self.assertEqual(repo.stats("abc", "2026-01-01")["total_clicks"], 5)
+        self.assertEqual(rec.flush(), 0)
+
+    def test_bounded_queue_drops_instead_of_blocking(self):
+        rec = ClickRecorder(Repository(":memory:"), max_queue=2)
+        results = [rec.record(event(i)) for i in range(4)]
+        self.assertEqual(results, [True, True, False, False])
+        self.assertEqual(rec.dropped, 2)
+
+    def test_persistence_failure_is_contained(self):
+        class Broken:
+            def record_clicks(self, events):
+                raise RuntimeError("db down")
+        rec = ClickRecorder(Broken())
+        rec.record(event())
+        self.assertEqual(rec.flush(), 1)  # must not raise
+        self.assertEqual(rec.failed, 1)
+
+    def test_manual_flush_waits_for_a_batch_the_background_thread_is_still_writing(self):
+        import time
+
+        class SlowRepo:
+            def __init__(self):
+                self.rows = []
+
+            def record_clicks(self, events):
+                time.sleep(0.3)  # the background thread is "mid-write" while we call flush()
+                self.rows.extend(events)
+        repo = SlowRepo()
+        rec = ClickRecorder(repo, flush_interval=0.01)
+        rec.start()
+        rec.record(event())
+        time.sleep(0.1)  # background thread has drained the queue and is inside record_clicks
+        rec.flush()
+        self.assertEqual(len(repo.rows), 1)  # read-your-writes: flush() returned only after the batch was persisted
+        rec.stop()
+
+    def test_background_thread_flushes_and_stop_drains(self):
+        repo = Repository(":memory:")
+        rec = ClickRecorder(repo, flush_interval=0.05)
+        rec.start()
+        rec.record(event())
+        rec.stop()
+        self.assertEqual(repo.stats("abc", "2026-01-01")["total_clicks"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

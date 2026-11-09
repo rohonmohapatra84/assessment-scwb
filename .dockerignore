@@ -1,0 +1,9 @@
+.env
+output/
+tests/
+docs/
+infra/
+.git
+__pycache__/
+*.pyc
+*.md

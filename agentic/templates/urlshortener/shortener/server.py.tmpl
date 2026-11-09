@@ -1,0 +1,46 @@
+"""Process entry point:  python -m shortener.server --port 8080"""
+from __future__ import annotations
+
+import argparse
+import logging
+from socketserver import ThreadingMixIn
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
+
+from .app import Application
+from .config import Config
+
+
+class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True
+
+
+class QuietHandler(WSGIRequestHandler):
+    def log_message(self, format, *args):  # access logging is done by the app (with request ids)
+        pass
+
+
+def make_http_server(app: Application, host: str = "127.0.0.1", port: int = 0) -> WSGIServer:
+    return make_server(host, port, app, server_class=ThreadingWSGIServer, handler_class=QuietHandler)
+
+
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser(description="URL shortener service")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8080)
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    config = Config.from_env()
+    app = Application(config)
+    httpd = make_http_server(app, args.host, args.port)
+    logging.getLogger("shortener").info("listening on http://%s:%s", args.host, httpd.server_address[1])
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+        app.close()  # flushes buffered click events
+
+
+if __name__ == "__main__":
+    main()

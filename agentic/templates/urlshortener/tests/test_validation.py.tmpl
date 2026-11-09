@@ -1,0 +1,41 @@
+import unittest
+
+from shortener.errors import InvalidAlias, InvalidUrl
+from shortener.validation import validate_alias, validate_url
+
+
+class UrlValidationTests(unittest.TestCase):
+    def test_accepts_http_and_https(self):
+        self.assertEqual(validate_url("https://example.com/a?b=c#d"), "https://example.com/a?b=c#d")
+        self.assertEqual(validate_url("  http://example.org  "), "http://example.org")
+
+    def test_rejects_bad_input(self):
+        bad = [
+            None, "", "   ", 123,
+            "ftp://example.com/file", "javascript:alert(1)", "data:text/html,hi", "//example.com",
+            "https://user:pw@example.com/", "https://", "not a url",
+            "https://exa mple.com", "https://example.com/\r\nInjected: 1",
+            "http://localhost/x", "http://127.0.0.1/x", "http://10.0.0.5/x", "http://192.168.1.1/",
+            "http://169.254.169.254/latest/meta-data", "http://[::1]/", "http://service.internal/",
+            "https://example.com:notaport/", "https://example.com/" + "a" * 2100,
+        ]
+        for url in bad:
+            with self.subTest(url=url):
+                with self.assertRaises(InvalidUrl):
+                    validate_url(url)
+
+
+class AliasValidationTests(unittest.TestCase):
+    def test_accepts(self):
+        for alias in ("abc", "my-link_1", "A" * 32):
+            self.assertEqual(validate_alias(alias), alias)
+
+    def test_rejects(self):
+        for alias in (None, "", "ab", "a" * 33, "has space", "emoji❤", "slash/inside", "api", "HEALTHZ", 5):
+            with self.subTest(alias=alias):
+                with self.assertRaises(InvalidAlias):
+                    validate_alias(alias)
+
+
+if __name__ == "__main__":
+    unittest.main()

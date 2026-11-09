@@ -1,0 +1,56 @@
+"""Domain errors. Each carries the HTTP status and a stable machine-readable code
+so the HTTP layer can map them without if/else chains."""
+from __future__ import annotations
+
+from typing import Optional
+
+
+class ShortenerError(Exception):
+    status = 500
+    code = "internal_error"
+
+    def __init__(self, message: Optional[str] = None):
+        self.message = message or self.code.replace("_", " ")
+        super().__init__(self.message)
+
+
+class BadRequest(ShortenerError):
+    status = 400
+    code = "bad_request"
+
+
+class InvalidUrl(BadRequest):
+    code = "invalid_url"
+
+
+class InvalidAlias(BadRequest):
+    code = "invalid_alias"
+
+
+class Unauthorized(ShortenerError):
+    status = 401
+    code = "unauthorized"
+
+
+class NotFound(ShortenerError):
+    status = 404
+    code = "not_found"
+
+
+class MethodNotAllowed(ShortenerError):
+    status = 405
+    code = "method_not_allowed"
+
+
+class LinkNotFound(NotFound):
+    code = "link_not_found"
+
+
+class AliasTaken(ShortenerError):
+    status = 409
+    code = "alias_taken"
+
+
+class RateLimited(ShortenerError):
+    status = 429
+    code = "rate_limited"

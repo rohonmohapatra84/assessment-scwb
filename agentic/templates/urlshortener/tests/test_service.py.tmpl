@@ -1,0 +1,114 @@
+import unittest
+
+from shortener.analytics import ClickRecorder
+from shortener.config import Config
+from shortener.errors import AliasTaken, BadRequest, InvalidAlias, InvalidUrl, LinkNotFound, ShortenerError
+from shortener.models import Visitor
+from shortener.service import ShortenerService
+from shortener.storage import Repository
+
+from .helpers import FakeClock
+
+
+def build(code_factory=None):
+    config = Config(db_path=":memory:")
+    repo = Repository(":memory:")
+    recorder = ClickRecorder(repo)
+    clock = FakeClock()
+    service = ShortenerService(repo, config, recorder=recorder, now=clock, code_factory=code_factory)
+    return service, clock
+
+
+VISITOR = Visitor(ip="203.0.113.1", user_agent="Mozilla/5.0 (X11; Linux)", referrer="https://news.example/")
+
+
+class ServiceTests(unittest.TestCase):
+    def test_create_generates_code_of_configured_length(self):
+        service, _ = build()
+        link = service.create_link("https://example.com/path")
+        self.assertEqual(len(link.code), 7)
+        self.assertEqual(link.long_url, "https://example.com/path")
+
+    def test_custom_alias(self):
+        service, _ = build()
+        self.assertEqual(service.create_link("https://example.com", alias="my-link").code, "my-link")
+
+    def test_alias_taken_and_invalid(self):
+        service, _ = build()
+        service.create_link("https://example.com", alias="taken")
+        with self.assertRaises(AliasTaken):
+            service.create_link("https://other.example", alias="taken")
+        with self.assertRaises(InvalidAlias):
+            service.create_link("https://example.com", alias="no spaces")
+
+    def test_invalid_url_rejected(self):
+        service, _ = build()
+        with self.assertRaises(InvalidUrl):
+            service.create_link("javascript:alert(1)")
+
+    def test_collision_retry(self):
+        codes = iter(["AAAAAAA", "AAAAAAA", "BBBBBBB"])
+        service, _ = build(code_factory=lambda: next(codes))
+        first = service.create_link("https://one.example")
+        second = service.create_link("https://two.example")  # first draw collides, retry succeeds
+        self.assertEqual((first.code, second.code), ("AAAAAAA", "BBBBBBB"))
+
+    def test_collision_retries_are_bounded(self):
+        service, _ = build(code_factory=lambda: "SAMECODE")
+        service.create_link("https://one.example")
+        with self.assertRaises(ShortenerError):
+            service.create_link("https://two.example")
+
+    def test_resolve_returns_target_and_records_click(self):
+        service, _ = build()
+        code = service.create_link("https://example.com").code
+        self.assertEqual(service.resolve(code, VISITOR), "https://example.com")
+        service.recorder.flush()
+        self.assertEqual(service.stats(code)["total_clicks"], 1)
+
+    def test_resolve_unknown_raises(self):
+        service, _ = build()
+        with self.assertRaises(LinkNotFound):
+            service.resolve("nope123", VISITOR)
+
+    def test_cache_hit(self):
+        service, _ = build()
+        code = service.create_link("https://example.com").code
+        service.resolve(code, VISITOR)
+        service.resolve(code, VISITOR)
+        stats = service.cache.stats()
+        self.assertEqual((stats["hits"], stats["misses"]), (1, 1))
+
+    def test_delete_invalidates_cache(self):
+        service, _ = build()
+        code = service.create_link("https://example.com").code
+        service.resolve(code, VISITOR)  # populate cache
+        service.delete_link(code)
+        with self.assertRaises(LinkNotFound):
+            service.resolve(code, VISITOR)
+        with self.assertRaises(LinkNotFound):
+            service.delete_link(code)
+
+    def test_stats_validates_days_and_existence(self):
+        service, _ = build()
+        code = service.create_link("https://example.com").code
+        for bad in (0, 91, -1, "7", True):
+            with self.subTest(days=bad):
+                with self.assertRaises(BadRequest):
+                    service.stats(code, bad)
+        with self.assertRaises(LinkNotFound):
+            service.stats("missing")
+
+    def test_stats_window_follows_clock(self):
+        service, clock = build()
+        code = service.create_link("https://example.com").code
+        service.resolve(code, VISITOR)
+        clock.advance(10 * 86400)
+        service.resolve(code, VISITOR)
+        service.recorder.flush()
+        self.assertEqual(service.stats(code, days=3)["clicks_by_day"][0]["clicks"], 1)
+        self.assertEqual(service.stats(code, days=30)["total_clicks"], 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

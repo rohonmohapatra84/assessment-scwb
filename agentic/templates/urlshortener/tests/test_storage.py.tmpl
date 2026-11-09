@@ -1,0 +1,102 @@
+import os
+import sqlite3
+import tempfile
+import unittest
+
+from shortener.errors import AliasTaken
+from shortener.models import ClickEvent, Visitor
+from shortener.storage import MIGRATIONS, Repository
+
+from .helpers import make_app
+
+
+def _click(code="abc", ts="2026-01-01T10:00:00+00:00", visitor="v1", ref=None, device="desktop"):
+    return ClickEvent(code=code, ts=ts, visitor_hash=visitor, referrer=ref, device=device)
+
+
+class RepositoryTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = Repository(":memory:")
+
+    def test_create_and_get(self):
+        link = self.repo.create_link("abc1234", "https://example.com", "2026-01-01T00:00:00+00:00")
+        self.assertEqual(self.repo.get_link("abc1234"), link)
+        self.assertIsNone(self.repo.get_link("missing"))
+
+    def test_duplicate_code_raises(self):
+        self.repo.create_link("abc1234", "https://a.example", "t")
+        with self.assertRaises(AliasTaken):
+            self.repo.create_link("abc1234", "https://b.example", "t")
+
+    def test_soft_delete_hides_link_but_keeps_code_reserved(self):
+        self.repo.create_link("abc1234", "https://a.example", "t")
+        self.assertTrue(self.repo.delete_link("abc1234", "t2"))
+        self.assertIsNone(self.repo.get_link("abc1234"))
+        self.assertFalse(self.repo.delete_link("abc1234", "t3"))  # idempotent
+        with self.assertRaises(AliasTaken):  # no hijacking of a deleted code
+            self.repo.create_link("abc1234", "https://evil.example", "t")
+
+    def test_migrations_idempotent(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.db")
+            first = Repository(path)
+            version = first.schema_version()
+            first.close()
+            second = Repository(path)  # re-open: must not re-apply or fail
+            self.assertEqual(second.schema_version(), version)
+            self.assertEqual(version, max(v for v, _ in MIGRATIONS))
+            second.close()
+
+    def test_data_persists_across_reopen(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.db")
+            repo = Repository(path)
+            repo.create_link("persist1", "https://example.com", "t")
+            repo.close()
+            self.assertIsNotNone(Repository(path).get_link("persist1"))
+
+    def test_click_aggregation(self):
+        self.repo.record_clicks([
+            _click(visitor="v1", ref="https://news.example"), _click(visitor="v1"),
+            _click(visitor="v2", ref="https://news.example", device="mobile"),
+            _click(ts="2026-01-02T09:00:00+00:00", visitor="v3", device="mobile"),
+        ])
+        s = self.repo.stats("abc", "2025-12-30")
+        self.assertEqual(s["total_clicks"], 4)
+        self.assertEqual(s["unique_visitors"], 3)
+        self.assertEqual(s["clicks_by_day"], [{"day": "2026-01-01", "clicks": 3}, {"day": "2026-01-02", "clicks": 1}])
+        self.assertEqual({r["referrer"]: r["clicks"] for r in s["top_referrers"]},
+                         {"https://news.example": 2, "(direct)": 2})
+        self.assertEqual({d["device"]: d["clicks"] for d in s["devices"]}, {"desktop": 2, "mobile": 2})
+
+    def test_daily_upsert_accumulates_across_batches(self):
+        self.repo.record_clicks([_click()])
+        self.repo.record_clicks([_click(), _click()])
+        self.assertEqual(self.repo.stats("abc", "2026-01-01")["total_clicks"], 3)
+
+    def test_window_excludes_old_days_but_total_is_all_time(self):
+        self.repo.record_clicks([_click(ts="2025-06-01T00:00:00+00:00"), _click(ts="2026-01-01T00:00:00+00:00")])
+        s = self.repo.stats("abc", "2025-12-25")
+        self.assertEqual(s["total_clicks"], 2)
+        self.assertEqual(len(s["clicks_by_day"]), 1)
+
+    def test_ping(self):
+        self.assertTrue(self.repo.ping())
+
+
+class PrivacyTests(unittest.TestCase):
+    def test_no_raw_ip(self):
+        app, service, clock, client = make_app()
+        code = service.create_link("https://example.com").code
+        ip = "198.51.100.77"
+        service.resolve(code, Visitor(ip=ip, user_agent="Mozilla/5.0", referrer=""))
+        service.recorder.flush()
+        conn = service.repo._conn
+        columns = [r[1] for r in conn.execute("PRAGMA table_info(click_events)")]
+        self.assertFalse(any("ip" == c or c.endswith("_ip") for c in columns))
+        dump = " ".join(str(v) for row in conn.execute("SELECT * FROM click_events") for v in tuple(row))
+        self.assertNotIn(ip, dump)
+
+
+if __name__ == "__main__":
+    unittest.main()

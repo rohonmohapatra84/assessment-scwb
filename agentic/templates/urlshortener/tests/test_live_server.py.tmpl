@@ -1,0 +1,95 @@
+"""End-to-end tests over a real TCP socket, including restart persistence (AC-7)."""
+import http.client
+import json
+import os
+import tempfile
+import threading
+import unittest
+
+from shortener.app import Application
+from shortener.config import Config
+from shortener.server import make_http_server
+
+
+class Server:
+    def __init__(self, db_path):
+        self.app = Application(Config(db_path=db_path, flush_interval_seconds=0.05))
+        self.httpd = make_http_server(self.app, "127.0.0.1", 0)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def request(self, method, path, body=None, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        payload = json.dumps(body) if body is not None else None
+        conn.request(method, path, body=payload, headers=headers or {})
+        resp = conn.getresponse()
+        data = resp.read()
+        out = (resp.status, {k.lower(): v for k, v in resp.getheaders()}, data)
+        conn.close()
+        return out
+
+    def stop(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.app.close()
+
+
+class LiveServerTests(unittest.TestCase):
+    def test_create_redirect_stats_over_http(self):
+        with tempfile.TemporaryDirectory() as d:
+            srv = Server(os.path.join(d, "live.db"))
+            try:
+                status, _, data = srv.request("POST", "/api/v1/links", {"url": "https://example.com/live"})
+                self.assertEqual(status, 201)
+                code = json.loads(data)["code"]
+                status, headers, _ = srv.request("GET", f"/{code}")  # http.client never follows redirects
+                self.assertEqual((status, headers["location"]), (302, "https://example.com/live"))
+                srv.app.service.recorder.flush()
+                status, _, data = srv.request("GET", f"/api/v1/links/{code}/stats")
+                self.assertEqual((status, json.loads(data)["total_clicks"]), (200, 1))
+            finally:
+                srv.stop()
+
+    def test_links_survive_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "restart.db")
+            first = Server(db)
+            try:
+                _, _, data = first.request("POST", "/api/v1/links", {"url": "https://example.com/durable"})
+                code = json.loads(data)["code"]
+            finally:
+                first.stop()
+            second = Server(db)  # brand-new process state, same database file
+            try:
+                status, headers, _ = second.request("GET", f"/{code}")
+                self.assertEqual((status, headers["location"]), (302, "https://example.com/durable"))
+            finally:
+                second.stop()
+
+    def test_concurrent_creates_produce_unique_codes(self):
+        with tempfile.TemporaryDirectory() as d:
+            srv = Server(os.path.join(d, "conc.db"))
+            srv.app.limiter.capacity = 0  # disable rate limiting for this load test
+            codes, errors = [], []
+
+            def worker():
+                for _ in range(10):
+                    try:
+                        status, _, data = srv.request("POST", "/api/v1/links", {"url": "https://example.com/c"})
+                        (codes if status == 201 else errors).append(json.loads(data).get("code", status))
+                    except Exception as exc:  # pragma: no cover
+                        errors.append(repr(exc))
+            try:
+                threads = [threading.Thread(target=worker) for _ in range(8)]
+                [t.start() for t in threads]
+                [t.join() for t in threads]
+            finally:
+                srv.stop()
+            self.assertEqual(errors, [])
+            self.assertEqual(len(codes), 80)
+            self.assertEqual(len(set(codes)), 80)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,170 @@
+"""Persistence port + SQLite adapter (ADR-002).
+
+Schema changes are forward-only, additive and versioned (MIGRATIONS), applied
+inside a transaction at start-up. Swap this class for a PostgreSQL/DynamoDB
+adapter with the same method signatures to scale out; nothing above it changes.
+"""
+from __future__ import annotations
+
+import sqlite3
+import threading
+from collections import defaultdict
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, Optional
+
+from .errors import AliasTaken
+from .models import ClickEvent, Link
+
+MIGRATIONS = [
+    (1, """
+        CREATE TABLE links (
+            code TEXT PRIMARY KEY,
+            long_url TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            deleted_at TEXT
+        );
+        CREATE TABLE click_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            visitor_hash TEXT NOT NULL,
+            referrer TEXT,
+            device TEXT NOT NULL
+        );
+        CREATE INDEX idx_click_events_code_ts ON click_events (code, ts);
+        CREATE TABLE click_daily (
+            code TEXT NOT NULL,
+            day TEXT NOT NULL,
+            clicks INTEGER NOT NULL,
+            PRIMARY KEY (code, day)
+        )
+    """),
+]  # --- end of migrations ---
+
+
+def _row_to_link(row: sqlite3.Row) -> Link:
+    return Link(
+        code=row["code"],
+        long_url=row["long_url"],
+        created_at=row["created_at"],
+    )
+
+
+class Repository:
+    def __init__(self, path: str = ":memory:"):
+        # One shared connection guarded by a lock: simple and correct for the
+        # prototype. A production adapter would use a connection pool.
+        self._conn = sqlite3.connect(path, check_same_thread=False, timeout=5.0, isolation_level=None)
+        self._conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._migrate()
+
+    @contextmanager
+    def _tx(self):
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._conn
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            else:
+                self._conn.execute("COMMIT")
+
+    def _migrate(self) -> None:
+        with self._tx() as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations "
+                         "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+            current = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
+            for version, sql in MIGRATIONS:
+                if version <= current:
+                    continue
+                for stmt in (s.strip() for s in sql.split(";")):
+                    if stmt:
+                        conn.execute(stmt)
+                conn.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                             (version, datetime.now(timezone.utc).isoformat()))
+
+    def schema_version(self) -> int:
+        with self._lock:
+            return self._conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
+
+    # ----------------------------------------------------------------- links
+    def create_link(self, code: str, long_url: str, created_at: str) -> Link:
+        try:
+            with self._tx() as conn:
+                conn.execute(
+                    "INSERT INTO links (code, long_url, created_at) VALUES (?, ?, ?)",
+                    (code, long_url, created_at),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise AliasTaken(f"code '{code}' is already in use") from exc
+        return Link(code=code, long_url=long_url, created_at=created_at)
+
+    def get_link(self, code: str) -> Optional[Link]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT code, long_url, created_at FROM links WHERE code = ? AND deleted_at IS NULL", (code,)
+            ).fetchone()
+        return _row_to_link(row) if row else None
+
+    def delete_link(self, code: str, deleted_at: str) -> bool:
+        # Soft delete: the code stays reserved so it can never be re-registered
+        # to a different destination (prevents link hijacking).
+        with self._tx() as conn:
+            cur = conn.execute("UPDATE links SET deleted_at = ? WHERE code = ? AND deleted_at IS NULL",
+                               (deleted_at, code))
+            return cur.rowcount > 0
+
+    # ------------------------------------------------------------- analytics
+    def record_clicks(self, events: Iterable[ClickEvent]) -> None:
+        events = list(events)
+        if not events:
+            return
+        daily: Dict[tuple, int] = defaultdict(int)
+        for e in events:
+            daily[(e.code, e.ts[:10])] += 1
+        with self._tx() as conn:
+            conn.executemany(
+                "INSERT INTO click_events (code, ts, visitor_hash, referrer, device) VALUES (?, ?, ?, ?, ?)",
+                [(e.code, e.ts, e.visitor_hash, e.referrer, e.device) for e in events])
+            conn.executemany(
+                "INSERT INTO click_daily (code, day, clicks) VALUES (?, ?, ?) "
+                "ON CONFLICT(code, day) DO UPDATE SET clicks = clicks + excluded.clicks",
+                [(c, d, n) for (c, d), n in daily.items()])
+
+    def stats(self, code: str, since_day: str) -> Dict[str, Any]:
+        with self._lock:
+            c = self._conn
+            total = c.execute("SELECT COALESCE(SUM(clicks), 0) FROM click_daily WHERE code = ?", (code,)).fetchone()[0]
+            by_day = c.execute("SELECT day, clicks FROM click_daily WHERE code = ? AND day >= ? ORDER BY day",
+                               (code, since_day)).fetchall()
+            unique = c.execute("SELECT COUNT(DISTINCT visitor_hash) FROM click_events WHERE code = ? AND ts >= ?",
+                               (code, since_day)).fetchone()[0]
+            refs = c.execute("SELECT COALESCE(referrer, '(direct)') AS r, COUNT(*) AS n FROM click_events "
+                             "WHERE code = ? AND ts >= ? GROUP BY r ORDER BY n DESC, r LIMIT 5",
+                             (code, since_day)).fetchall()
+            devs = c.execute("SELECT device, COUNT(*) AS n FROM click_events WHERE code = ? AND ts >= ? "
+                             "GROUP BY device ORDER BY n DESC, device", (code, since_day)).fetchall()
+        return {
+            "total_clicks": total,
+            "unique_visitors": unique,
+            "clicks_by_day": [{"day": r["day"], "clicks": r["clicks"]} for r in by_day],
+            "top_referrers": [{"referrer": r["r"], "clicks": r["n"]} for r in refs],
+            "devices": [{"device": r["device"], "clicks": r["n"]} for r in devs],
+        }
+
+    def ping(self) -> bool:
+        try:
+            with self._lock:
+                self._conn.execute("SELECT 1").fetchone()
+            return True
+        except sqlite3.Error:
+            return False
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()

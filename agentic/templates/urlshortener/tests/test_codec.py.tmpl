@@ -1,0 +1,38 @@
+import unittest
+
+from shortener.codec import ALPHABET, decode_base62, encode_base62, generate_code
+
+
+class CodecTests(unittest.TestCase):
+    def test_roundtrip(self):
+        for n in (0, 1, 61, 62, 12345, 62 ** 7 - 1, 10 ** 15):
+            self.assertEqual(decode_base62(encode_base62(n)), n)
+
+    def test_known_values(self):
+        self.assertEqual(encode_base62(0), "0")
+        self.assertEqual(encode_base62(61), "z")
+        self.assertEqual(encode_base62(62), "10")
+
+    def test_decode_rejects_invalid_chars(self):
+        with self.assertRaises(ValueError):
+            decode_base62("ab!")
+
+    def test_negative_rejected(self):
+        with self.assertRaises(ValueError):
+            encode_base62(-1)
+
+    def test_generate_code_shape(self):
+        code = generate_code(7)
+        self.assertEqual(len(code), 7)
+        self.assertTrue(set(code) <= set(ALPHABET))
+
+    def test_generate_code_is_not_constant(self):
+        self.assertGreater(len({generate_code(7) for _ in range(500)}), 495)
+
+    def test_too_short_rejected(self):
+        with self.assertRaises(ValueError):
+            generate_code(2)
+
+
+if __name__ == "__main__":
+    unittest.main()

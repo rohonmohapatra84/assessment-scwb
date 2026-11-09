@@ -1,0 +1,87 @@
+"""Load smoke test (non-functional check for NFR-2).
+
+Starts a live node on an ephemeral port with a temp database, creates one link,
+hammers GET /{code} from N threads, and prints throughput and latency
+percentiles as JSON. Run:  python scripts/load_smoke.py --requests 4000 --threads 16
+
+This is a smoke test, not a benchmark: one process, Python's wsgiref server and
+one SQLite file. Use it to catch regressions and to compare before/after a
+change (e.g. cache on/off), not to size production capacity.
+"""
+import argparse
+import http.client
+import json
+import os
+import statistics
+import sys
+import tempfile
+import threading
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from shortener.app import Application  # noqa: E402
+from shortener.config import Config  # noqa: E402
+from shortener.server import make_http_server  # noqa: E402
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--requests", type=int, default=2000)
+    parser.add_argument("--threads", type=int, default=8)
+    args = parser.parse_args()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Application(Config(db_path=os.path.join(tmp, "load.db"), rate_limit_per_minute=0))
+        httpd = make_http_server(app, "127.0.0.1", 0)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.request("POST", "/api/v1/links", json.dumps({"url": "https://example.com/load"}))
+        code = json.loads(conn.getresponse().read())["code"]
+        conn.close()
+
+        latencies, failures = [], []
+        lock = threading.Lock()
+        per_thread = args.requests // args.threads
+
+        def worker() -> None:
+            local = []
+            for _ in range(per_thread):
+                t0 = time.perf_counter()
+                try:
+                    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    c.request("GET", f"/{code}")
+                    r = c.getresponse()
+                    r.read()
+                    c.close()
+                    if r.status != 302:
+                        raise RuntimeError(r.status)
+                except Exception as exc:
+                    with lock:
+                        failures.append(repr(exc))
+                    continue
+                local.append((time.perf_counter() - t0) * 1000)
+            with lock:
+                latencies.extend(local)
+
+        started = time.perf_counter()
+        threads = [threading.Thread(target=worker) for _ in range(args.threads)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        elapsed = time.perf_counter() - started
+        httpd.shutdown()
+        app.close()
+
+    latencies.sort()
+    pct = lambda p: round(latencies[min(len(latencies) - 1, int(len(latencies) * p))], 2) if latencies else None
+    print(json.dumps({
+        "requests": len(latencies), "failures": len(failures), "threads": args.threads,
+        "rps": round(len(latencies) / elapsed, 1), "p50_ms": pct(0.50), "p95_ms": pct(0.95), "p99_ms": pct(0.99),
+        "mean_ms": round(statistics.mean(latencies), 2) if latencies else None,
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()

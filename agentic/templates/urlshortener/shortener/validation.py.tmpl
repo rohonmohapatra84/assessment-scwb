@@ -1,0 +1,59 @@
+"""Input policy: what destinations and aliases we are willing to shorten (risk R2)."""
+from __future__ import annotations
+
+import ipaddress
+import re
+from typing import Any
+from urllib.parse import urlsplit
+
+from .errors import InvalidAlias, InvalidUrl
+
+MAX_URL_LENGTH = 2048
+ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]{3,32}$")
+RESERVED_ALIASES = frozenset({"api", "healthz", "readyz", "openapi.json", "admin", "static", "metrics"})
+BLOCKED_SUFFIXES = (".localhost", ".local", ".internal", ".lan")
+
+
+def _blocked_host(host: str) -> bool:
+    host = host.lower().rstrip(".")
+    if host == "localhost" or host.endswith(BLOCKED_SUFFIXES):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # a DNS name; production should also resolve + re-check (DNS rebinding)
+    return (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+            or ip.is_multicast or ip.is_unspecified)
+
+
+def validate_url(raw: Any) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise InvalidUrl("url is required")
+    url = raw.strip()
+    if len(url) > MAX_URL_LENGTH:
+        raise InvalidUrl(f"url exceeds {MAX_URL_LENGTH} characters")
+    if any(ord(c) <= 32 or ord(c) == 127 for c in url):
+        raise InvalidUrl("url must not contain whitespace or control characters")
+    try:
+        parts = urlsplit(url)
+        _ = parts.port  # raises ValueError on a malformed port
+    except ValueError:
+        raise InvalidUrl("url is malformed") from None
+    if parts.scheme.lower() not in ("http", "https"):
+        raise InvalidUrl("only http and https URLs are allowed")
+    if not parts.hostname:
+        raise InvalidUrl("url must include a host")
+    if parts.username or parts.password:
+        raise InvalidUrl("credentials in URLs are not allowed")
+    if _blocked_host(parts.hostname):
+        raise InvalidUrl("destination host is not allowed")
+    return url
+
+
+def validate_alias(raw: Any) -> str:
+    # fullmatch, not match: '$' would accept a trailing newline
+    if not isinstance(raw, str) or not ALIAS_RE.fullmatch(raw):
+        raise InvalidAlias("alias must be 3-32 chars of letters, digits, '-' or '_'")
+    if raw.lower() in RESERVED_ALIASES:
+        raise InvalidAlias("alias is reserved")
+    return raw

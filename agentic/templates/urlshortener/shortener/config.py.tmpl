@@ -1,0 +1,37 @@
+"""Runtime configuration (12-factor: everything overridable by environment)."""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Tuple
+
+
+@dataclass(frozen=True)
+class Config:
+    db_path: str = "shortener.db"
+    base_url: str = "http://localhost:8080"
+    code_length: int = {{CODE_LENGTH}}
+    redirect_status: int = {{REDIRECT_STATUS}}  # 302 keeps every click observable (see ADR-003)
+    cache_size: int = 10_000
+    cache_ttl_seconds: int = 60
+    rate_limit_per_minute: int = {{RATE_LIMIT}}  # per client, on POST /api/v1/links; 0 disables
+    api_keys: Tuple[str, ...] = ()  # empty => open API (dev); set to require X-API-Key
+    flush_interval_seconds: float = 1.0
+    visitor_salt: str = "change-me-in-production"
+    trust_proxy: bool = False  # honour X-Forwarded-For only behind a trusted proxy
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        env = os.environ
+        keys = tuple(k.strip() for k in env.get("SHORTENER_API_KEYS", "").split(",") if k.strip())
+        defaults = cls()
+        return cls(
+            db_path=env.get("SHORTENER_DB", defaults.db_path),
+            base_url=env.get("SHORTENER_BASE_URL", defaults.base_url).rstrip("/"),
+            code_length=int(env.get("SHORTENER_CODE_LENGTH", defaults.code_length)),
+            redirect_status=int(env.get("SHORTENER_REDIRECT_STATUS", defaults.redirect_status)),
+            rate_limit_per_minute=int(env.get("SHORTENER_RATE_LIMIT", defaults.rate_limit_per_minute)),
+            api_keys=keys,
+            visitor_salt=env.get("SHORTENER_VISITOR_SALT", defaults.visitor_salt),
+            trust_proxy=env.get("SHORTENER_TRUST_PROXY", "0") == "1",
+        )

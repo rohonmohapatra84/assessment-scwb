@@ -1,0 +1,48 @@
+"""Contract tests: openapi.json is the source of truth; the router must match it."""
+import json
+import unittest
+from pathlib import Path
+
+from shortener.app import router
+
+SPEC = json.loads((Path(__file__).resolve().parent.parent / "openapi.json").read_text(encoding="utf-8"))
+
+
+def spec_operations():
+    return {(m.upper(), p): op for p, item in SPEC["paths"].items() for m, op in item.items()}
+
+
+class ContractTests(unittest.TestCase):
+    def test_every_documented_operation_is_routed_and_vice_versa(self):
+        routed = {(r.method, r.template) for r in router._routes}
+        documented = set(spec_operations())
+        self.assertEqual(routed - documented, set(), "routes missing from openapi.json")
+        self.assertEqual(documented - routed, set(), "documented operations that are not implemented")
+
+    def test_operation_ids_are_unique(self):
+        ids = [op["operationId"] for op in spec_operations().values()]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_authenticated_routes_declare_security(self):
+        ops = spec_operations()
+        for r in router._routes:
+            declared = bool(ops[(r.method, r.template)].get("security"))
+            self.assertEqual(r.auth, declared, f"{r.method} {r.template}: auth flag and spec security disagree")
+
+    def test_error_responses_reference_the_error_schema(self):
+        for (method, path), op in spec_operations().items():
+            for status, resp in op["responses"].items():
+                if status.startswith(("4", "5")) and "content" in resp:
+                    ref = resp["content"]["application/json"]["schema"]["$ref"]
+                    self.assertEqual(ref, "#/components/schemas/Error", f"{method} {path} {status}")
+
+    def test_schema_refs_resolve(self):
+        text = json.dumps(SPEC)
+        for ref in {s.split('"')[0] for s in text.split('"$ref": "')[1:]}:
+            node = SPEC
+            for part in ref.lstrip("#/").split("/"):
+                node = node[part]
+
+
+if __name__ == "__main__":
+    unittest.main()

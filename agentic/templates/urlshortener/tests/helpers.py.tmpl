@@ -1,0 +1,68 @@
+"""Shared test fixtures: fake clock, in-process WSGI client, app factory."""
+from __future__ import annotations
+
+import io
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple
+
+from shortener.analytics import ClickRecorder
+from shortener.app import Application
+from shortener.config import Config
+from shortener.service import ShortenerService
+from shortener.storage import Repository
+
+
+class FakeClock:
+    def __init__(self, start: Optional[datetime] = None):
+        self.now = start or datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+class Resp:
+    def __init__(self, status: int, headers: Dict[str, str], body: bytes):
+        self.status, self.headers, self.body = status, headers, body
+
+    def json(self) -> Any:
+        return json.loads(self.body.decode("utf-8"))
+
+
+class Client:
+    """Calls the WSGI app directly (no sockets): fast, deterministic integration tests."""
+
+    def __init__(self, app: Application):
+        self.app = app
+
+    def request(self, method: str, path: str, body: Any = None, headers: Optional[Dict[str, str]] = None,
+                ip: str = "203.0.113.9", raw_body: Optional[bytes] = None) -> Resp:
+        path_info, _, query = path.partition("?")
+        data = raw_body if raw_body is not None else (json.dumps(body).encode() if body is not None else b"")
+        environ = {
+            "REQUEST_METHOD": method, "PATH_INFO": path_info, "QUERY_STRING": query,
+            "CONTENT_LENGTH": str(len(data)), "wsgi.input": io.BytesIO(data), "REMOTE_ADDR": ip,
+        }
+        for k, v in (headers or {}).items():
+            environ["HTTP_" + k.upper().replace("-", "_")] = v
+        captured: Dict[str, Any] = {}
+
+        def start_response(status, response_headers):
+            captured["status"] = int(status.split()[0])
+            captured["headers"] = {k.lower(): v for k, v in response_headers}
+
+        chunks = self.app(environ, start_response)
+        return Resp(captured["status"], captured["headers"], b"".join(chunks))
+
+
+def make_app(**config_overrides: Any) -> Tuple[Application, ShortenerService, FakeClock, Client]:
+    config = Config(db_path=":memory:", **config_overrides)
+    repo = Repository(":memory:")
+    recorder = ClickRecorder(repo)  # not started: tests call flush() for determinism
+    clock = FakeClock()
+    service = ShortenerService(repo, config, recorder=recorder, now=clock)
+    app = Application(config, service=service)
+    return app, service, clock, Client(app)

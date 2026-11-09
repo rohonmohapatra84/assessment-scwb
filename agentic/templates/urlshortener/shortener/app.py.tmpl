@@ -1,0 +1,225 @@
+"""WSGI application: routing, request parsing, auth, rate limiting and error mapping.
+
+Handlers are thin: they translate HTTP <-> service calls. Routes are declared
+with the `@router.route(method, template)` decorator so tooling (and the
+contract test) can discover them statically.
+"""
+from __future__ import annotations
+
+import hmac
+import json
+import logging
+import re
+import time
+import uuid
+from dataclasses import dataclass
+from http import HTTPStatus
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs
+
+from .analytics import ClickRecorder
+from .config import Config
+from .errors import (BadRequest, MethodNotAllowed, NotFound, RateLimited, ShortenerError, Unauthorized)
+from .models import Link, Visitor
+from .ratelimit import TokenBucketLimiter
+from .service import ShortenerService
+from .storage import Repository
+
+log = logging.getLogger("shortener.http")
+MAX_BODY_BYTES = 16 * 1024
+
+Response = Tuple[int, List[Tuple[str, str]], bytes]
+
+
+@dataclass
+class Request:
+    method: str
+    path: str
+    query: Dict[str, str]
+    headers: Dict[str, str]  # lower-cased names
+    body: bytes
+    client_ip: str
+
+    def json(self) -> Dict[str, Any]:
+        if not self.body:
+            raise BadRequest("request body is required")
+        try:
+            data = json.loads(self.body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise BadRequest("body must be valid JSON") from None
+        if not isinstance(data, dict):
+            raise BadRequest("body must be a JSON object")
+        return data
+
+
+def json_response(status: int, payload: Any, headers: Optional[List[Tuple[str, str]]] = None) -> Response:
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return status, [("Content-Type", "application/json")] + (headers or []), body
+
+
+def error_response(exc: ShortenerError) -> Response:
+    return json_response(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+
+
+@dataclass
+class _Route:
+    method: str
+    template: str
+    pattern: "re.Pattern[str]"
+    handler: Callable[..., Response]
+    auth: bool
+
+
+class Router:
+    def __init__(self) -> None:
+        self._routes: List[_Route] = []
+
+    def route(self, method: str, template: str, auth: bool = False):
+        regex = "^" + re.sub(r"\{(\w+)\}", r"(?P<\1>[A-Za-z0-9_-]{1,64})", template) + "$"
+
+        def decorator(fn: Callable[..., Response]) -> Callable[..., Response]:
+            self._routes.append(_Route(method, template, re.compile(regex), fn, auth))
+            return fn
+        return decorator
+
+    def match(self, method: str, path: str):
+        allowed: List[str] = []
+        for r in self._routes:  # registration order matters: specific before /{code}
+            m = r.pattern.match(path)
+            if m:
+                if r.method == method:
+                    return r, m.groupdict(), allowed
+                allowed.append(r.method)
+        return None, {}, allowed
+
+
+router = Router()
+
+
+# ---------------------------------------------------------------- handlers ---
+@router.route("GET", "/healthz")
+def healthz(app: "Application", req: Request) -> Response:
+    ok = app.service.repo.ping()
+    return json_response(200 if ok else 503, {"status": "ok" if ok else "unavailable"})
+
+
+@router.route("GET", "/openapi.json")
+def openapi(app: "Application", req: Request) -> Response:
+    spec = Path(__file__).resolve().parent.parent / "openapi.json"
+    if not spec.exists():
+        raise NotFound("openapi.json not bundled")
+    return 200, [("Content-Type", "application/json")], spec.read_bytes()
+
+
+@router.route("POST", "/api/v1/links", auth=True)
+def create_link(app: "Application", req: Request) -> Response:
+    if not app.limiter.allow(req.client_ip):
+        raise RateLimited("too many link creations, slow down")
+    body = req.json()
+    link = app.service.create_link(body.get("url"), body.get("custom_alias"))
+    return json_response(201, app.link_payload(link), [("Location", f"/api/v1/links/{link.code}")])
+
+
+@router.route("GET", "/api/v1/links/{code}", auth=True)
+def get_link(app: "Application", req: Request, code: str) -> Response:
+    return json_response(200, app.link_payload(app.service.get_link(code)))
+
+
+@router.route("DELETE", "/api/v1/links/{code}", auth=True)
+def delete_link(app: "Application", req: Request, code: str) -> Response:
+    app.service.delete_link(code)
+    return 204, [], b""
+
+
+@router.route("GET", "/api/v1/links/{code}/stats", auth=True)
+def link_stats(app: "Application", req: Request, code: str) -> Response:
+    try:
+        days = int(req.query.get("days", "7"))
+    except ValueError:
+        raise BadRequest("days must be an integer between 1 and 90") from None
+    return json_response(200, app.service.stats(code, days))
+
+
+@router.route("GET", "/{code}")
+def redirect(app: "Application", req: Request, code: str) -> Response:
+    visitor = Visitor(ip=req.client_ip, user_agent=req.headers.get("user-agent", ""),
+                      referrer=req.headers.get("referer", ""))
+    target = app.service.resolve(code, visitor)
+    return app.config.redirect_status, [("Location", target), ("Cache-Control", "private, max-age=0")], b""
+
+
+# ------------------------------------------------------------- application ---
+class Application:
+    def __init__(self, config: Config, service: Optional[ShortenerService] = None,
+                 limiter: Optional[TokenBucketLimiter] = None):
+        self.config = config
+        self._owns_service = service is None
+        if service is None:
+            repo = Repository(config.db_path)
+            recorder = ClickRecorder(repo, config.flush_interval_seconds)
+            service = ShortenerService(repo, config, recorder=recorder)
+            recorder.start()
+        self.service = service
+        self.limiter = limiter or TokenBucketLimiter(config.rate_limit_per_minute)
+
+    def link_payload(self, link: Link) -> Dict[str, Any]:
+        return {
+            "code": link.code,
+            "short_url": f"{self.config.base_url}/{link.code}",
+            "long_url": link.long_url,
+            "created_at": link.created_at,
+        }
+
+    def close(self) -> None:
+        if self.service.recorder is not None:
+            self.service.recorder.stop()
+        if self._owns_service:
+            self.service.repo.close()
+
+    # ---------------------------------------------------------------- WSGI
+    def __call__(self, environ, start_response):
+        started = time.perf_counter()
+        request_id = uuid.uuid4().hex[:16]
+        method, path = environ.get("REQUEST_METHOD", "GET"), environ.get("PATH_INFO", "/")
+        try:
+            response = self._dispatch(self._build_request(environ))
+        except ShortenerError as exc:
+            response = error_response(exc)
+        except Exception:  # never leak internals to clients
+            log.exception("unhandled error request_id=%s", request_id)
+            response = error_response(ShortenerError("internal server error"))
+        status, headers, body = response
+        headers = headers + [("X-Request-Id", request_id), ("X-Content-Type-Options", "nosniff"),
+                             ("Content-Length", str(len(body)))]
+        start_response(f"{status} {HTTPStatus(status).phrase}", headers)
+        log.info("%s %s -> %s %.1fms request_id=%s", method, path, status,
+                 (time.perf_counter() - started) * 1000, request_id)
+        return [body]
+
+    def _build_request(self, environ) -> Request:
+        try:
+            length = int(environ.get("CONTENT_LENGTH") or 0)
+        except ValueError:
+            raise BadRequest("invalid Content-Length") from None
+        if length > MAX_BODY_BYTES:
+            raise BadRequest("request body too large")
+        body = environ["wsgi.input"].read(length) if length else b""
+        headers = {k[5:].replace("_", "-").lower(): v for k, v in environ.items() if k.startswith("HTTP_")}
+        ip = environ.get("REMOTE_ADDR", "")
+        if self.config.trust_proxy and headers.get("x-forwarded-for"):
+            ip = headers["x-forwarded-for"].split(",")[0].strip()
+        query = {k: v[0] for k, v in parse_qs(environ.get("QUERY_STRING", "")).items()}
+        return Request(environ.get("REQUEST_METHOD", "GET"), environ.get("PATH_INFO", "/"), query, headers, body, ip)
+
+    def _dispatch(self, req: Request) -> Response:
+        route, params, allowed = router.match(req.method, req.path)
+        if route is None:
+            if allowed:
+                raise MethodNotAllowed(f"allowed: {', '.join(sorted(set(allowed)))}")
+            raise NotFound("no such route")
+        if route.auth and self.config.api_keys:
+            supplied = req.headers.get("x-api-key", "")
+            if not any(hmac.compare_digest(supplied, k) for k in self.config.api_keys):
+                raise Unauthorized("missing or invalid API key")
+        return route.handler(self, req, **params)

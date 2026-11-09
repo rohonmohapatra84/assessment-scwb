@@ -1,0 +1,29 @@
+"""Immutable value objects shared between layers."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass(frozen=True)
+class Link:
+    code: str
+    long_url: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class Visitor:
+    """Request-derived identity. The raw IP is only used to compute a salted hash."""
+    ip: str = ""
+    user_agent: str = ""
+    referrer: str = ""
+
+
+@dataclass(frozen=True)
+class ClickEvent:
+    code: str
+    ts: str
+    visitor_hash: str
+    referrer: Optional[str]
+    device: str

@@ -1,0 +1,1 @@
+Add support for expiring short links: callers can set an optional TTL when creating a link, and once expired the link must stop redirecting (return 410 Gone). Existing links must keep working.
