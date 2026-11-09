@@ -1,7 +1,7 @@
 # Optional: deploying to Azure Container Apps
 
 This document is only for running the harness as a **hosted HTTP service** with remote human approval. To run the scenarios on your own machine you do not need any of
-it: see [HOW_TO_RUN_AND_VERIFY.md](HOW_TO_RUN_AND_VERIFY.md) and [MODEL_SETUP.md](MODEL_SETUP.md).
+it: see the [root README](../README.md#5-prerequisites-and-quick-start) and [MODEL_SETUP.md](MODEL_SETUP.md).
 
 What the deployment adds:
 
@@ -26,31 +26,13 @@ What the deployment adds:
 
 ## 2. Step 1: prove the model connection locally
 
-Put the settings in `.env` (see [MODEL_SETUP.md](MODEL_SETUP.md)) or in the environment, then:
-
-```powershell
-python scripts/model_smoke.py
-```
-
-| Symptom | Meaning |
-|---|---|
-| `HTTP 401` | wrong key or wrong resource |
-| `HTTP 403` | with Entra auth: missing role **Cognitive Services OpenAI User** on the resource (can take minutes to propagate); with a key: firewall or network rules |
-| `HTTP 404` | `AZURE_AI_DEPLOYMENT` is not the *deployment name*, or the endpoint includes a path |
-| `HTTP 429` or truncated | quota or output limit; retry, or raise the deployment quota |
+Put the Azure settings in `.env` (the exact lines are in [MODEL_SETUP.md](MODEL_SETUP.md), "Complete `.env` examples") and run `python scripts/model_smoke.py`; it must end with a success message.
+The error meanings (401 wrong key, 403 missing the **Cognitive Services OpenAI User** role, 404 `AZURE_AI_DEPLOYMENT` is not the *deployment name*, 429 quota) are in the troubleshooting table of [MODEL_SETUP.md](MODEL_SETUP.md), section 5.
 
 ## 3. Step 2: run the scenarios locally first
 
-```powershell
-python run.py greenfield
-python run.py brownfield
-python run.py enhancement
-python run.py ambiguous
-python scripts/verify_outputs.py
-```
-
-The model is the default generator; there is no separate "LLM mode" flag to set. See [usecases/](usecases/) for what each does and how it is judged.
-
+Run greenfield and brownfield on your machine before deploying (the commands and what to check are in the [root README](../README.md#5-prerequisites-and-quick-start); `python scripts/verify_outputs.py` re-checks them).
+The model is the default generator; there is no separate "LLM mode" flag to set. See [usecases/](usecases/) for what each scenario does and how it is judged.
 ## 4. Step 3: deploy to Azure
 
 ```powershell

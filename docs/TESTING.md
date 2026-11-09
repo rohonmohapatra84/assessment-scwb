@@ -6,30 +6,20 @@ Three different things are tested, and they answer three different questions. Qu
 |---|---|---|
 | **A. The product** (the generated URL shortener, or the changed service) | does the software do what the requirement says? | the test suite the `spec_tester` agent wrote (73 tests in the committed greenfield run), **executed by the validator**; plus 14 black-box probes |
 | **B. The generation** | is this output consistent, safe and complete? | the validator's checks: static, probe, tests, regression, compat, test integrity, traceability (per use case: [usecases/](usecases/)) |
-| **C. The system** (the harness and agents) | do planning checks, recovery, guardrails and gates behave as claimed? | `tests/`: 266 tests, offline, a scripted stand-in plays the model |
+| **C. The system** (the harness and agents) | do planning checks, recovery, guardrails and gates behave as claimed? | `tests/`: 273 tests, offline, a scripted stand-in plays the model |
 
 How to run each, and how to re-check saved results: [HOW_TO_RUN_AND_VERIFY.md](HOW_TO_RUN_AND_VERIFY.md).
 
 ## A and B: what runs inside every scenario
 
-| Check family | What it executes | Used by |
-|---|---|---|
-| `static.*` | `ast.parse` of every Python file; secret scan; required files | greenfield, changes |
-| `probe.*` | a **black-box probe** drives the public WSGI interface through the documented flows (14 probes), then compares the database the code actually created with the designed schema | greenfield, changes (where the code exposes `create_app`) |
-| `tests.suite` | the whole suite in an isolated subprocess (hard timeout, scrubbed environment) | all code scenarios |
-| `regression.*` | baseline green before and after; suite grew (or not smaller); **new tests fail on the unfixed baseline** (bug fix) | changes |
-| `compat.*` | OpenAPI diff: additive only, or identical (refactor, tests/docs) | changes |
-| `tests.existing_tests_protected` | no baseline test differs from the pristine copy unless the amendment policy allows it | changes |
-| `scope.tests_docs_only` | no production file was written | tests/docs changes |
-| `traceability.*` | every acceptance criterion maps to a real `test_ac<N>_...` function (by AST) | greenfield |
-| `plan.*` | ambiguities resolved; objectives measurable; options with trade-offs; verification defined | ambiguous |
-
+The validator runs these families of checks: `static`, `probe`, `tests`, `regression`, `compat`, `tests.existing_tests_protected`, `scope` and `traceability` (and `plan` for the ambiguous case). What each one executes, what it blames, and which kinds of change require which checks is in
+[ARCHITECTURE.md](ARCHITECTURE.md), section 5. The use-case pages ([usecases/](usecases/)) list the checks and test cases specific to each scenario. Level A in numbers: the black-box probe drives the public interface through 14 documented flows, then compares the database the code created with the designed schema.
 The model-written service suite (committed run, 73 tests): `test_links.py` (19: creation, aliases, redirects, deletion, stats), `test_validation.py` (21: hostile URLs, CRLF, bad schemes, alias rules),
 `test_analytics_persistence.py` (16: batching, drop-not-block, unique visitors, persistence), `test_auth_rate_limit.py` (12: API keys, rate limiting), `test_contract.py` (5: router equals the OpenAPI document), plus a provided `wsgi_client.py` helper. File names and counts vary per run. They are deterministic: no sleeps, no network, no ports.
 
 ## Test-integrity policies: `tests/test_test_policy.py` (26 tests)
 
-The model writes both the code and the tests, so the harness must stop either from weakening the other.
+The model writes both the code and the tests, so the harness must stop either from weakening the other. The policies themselves are explained in [ARCHITECTURE.md](ARCHITECTURE.md), section 6; this table maps each rule to the test that proves it.
 
 | Policy | Proven by |
 |---|---|
@@ -45,7 +35,7 @@ The model writes both the code and the tests, so the harness must stop either fr
 
 *Honest limit:* the amendment check counts tests, assertions and skips; it does not understand what an assertion compares. A live amendment kept the count but made a contract comparison ignore `description` and `summary`. Only the human gate catches that.
 
-## C: the framework tests (`tests/`, 266 tests, about 5 minutes)
+## C: the framework tests (`tests/`, 273 tests, about 5 minutes)
 
 ```powershell
 python -m unittest discover -s tests -t .
@@ -53,12 +43,12 @@ python -m unittest discover -s tests -t .
 
 | File | Tests | Covers |
 |---|---|---|
-| `test_harness.py` | 71 | the tool catalog (every runnable step has a spec and vice versa; template tools hidden in model mode); **plan check** (unknown tool, tool used twice, missing `needs`, cycle, write conflict, validator must wait for everything, model cannot widen a write scope); the **loop with a lead** (the lead picks the order, no model call without a real choice, bad decisions refused then a logged fallback, abort, turn budget); the lead's prompt; end to end with a scripted lead (bad plan corrected, three bad plans stop the run, defect repaired by role, a human rejecting the plan stops everything); change-kind routing, catalog and validator rules; prompts tell the truth (only helpers that exist, the published contract is shown, the test author is told not to pin wording); one run per kind |
+| `test_harness.py` | 72 | the tool catalog (every runnable step has a spec and vice versa; template tools hidden in model mode); **plan check** (unknown tool, tool used twice, missing `needs`, cycle, write conflict, validator must wait for everything, model cannot widen a write scope); the **loop with a lead** (the lead picks the order, no model call without a real choice, bad decisions refused then a logged fallback, abort, turn budget); the lead's prompt; end to end with a scripted lead (bad plan corrected, three bad plans stop the run, defect repaired by role, a human rejecting the plan stops everything); change-kind routing, catalog and validator rules; prompts tell the truth (only helpers that exist, the published contract is shown, the test author is told not to pin wording); one run per kind |
 | `test_loop.py` | 20 | the loop with fake agents: DAG validation; dependency order and **real parallelism**; blackboard hand-off; transient retry with backoff; **dependents skipped, independent task still runs**; optional failure degrades; agent crash contained; **repair loop routes feedback to the responsible producer** and is bounded; self-correction; fault injection; **resume re-runs only unsuccessful tasks** |
-| `test_guardrails.py` | 14 | path traversal; extension allow-list; **write-scope enforcement**; secret scan; size cap; baseline import leaves the source untouched; promote; **test-runner timeout kills a hanging suite**; **a child process cannot see a parent secret**; approval policies (auto refuses blocking issues, reject, `reject:<gate>`, interactive is audited) |
-| `test_agents.py` | 15 | requirement analyst (assumption vs blocking ambiguity; numeric target removes ambiguity; answers recorded as human; **prompt injection flagged and not obeyed**; model output sanitised); plan shapes; OpenAPI diff classification; codebase analyst (routes, tables, **receiver-aware flows**, impact tiers) |
+| `test_guardrails.py` | 15 | path traversal; extension allow-list; **write-scope enforcement**; secret scan; size cap; baseline import leaves the source untouched; promote; **test-runner timeout kills a hanging suite**; **a child process cannot see a parent secret**; approval policies (auto refuses blocking issues, reject, `reject:<gate>`, interactive is audited) |
+| `test_agents.py` | 21 | requirement analyst (assumption vs blocking ambiguity; numeric target removes ambiguity; answers recorded as human; **prompt injection flagged and not obeyed**; model output sanitised); plan shapes; OpenAPI diff classification; codebase analyst (routes, tables, **receiver-aware flows**, impact tiers); **model output with a NUL byte or secret-like text is rejected as feedback, not a crash** |
 | `test_agent_specs.py` | 20 | the Markdown agent files: parsing, the fields each must have, they match the registered workers, no file names a vendor |
-| `test_llm.py` | 20 | the Azure provider wire format and error taxonomy; the **system's handling of model output** with a scripted model: probe passes, missing interface rejected and self-corrected, a **behavioural bug is caught and repaired with the failing probe quoted back**, throttling retried, `../escape.py` and embedded secrets blocked, the test author never sees the code, bad anchors rejected with feedback |
+| `test_llm.py` | 21 | the Azure provider wire format and error taxonomy; the **system's handling of model output** with a scripted model: probe passes, missing interface rejected and self-corrected, a **behavioural bug is caught and repaired with the failing probe quoted back**, throttling retried, `../escape.py` blocked, an embedded secret **sent back as feedback and fixed on retry** (and never written if it keeps leaking), the test author never sees the code, bad anchors rejected with feedback |
 | `test_providers.py` | 26 | provider selection, the OpenAI-compatible, Anthropic and command providers' request and response shapes (mocked HTTP and local scripts) |
 | `test_api_service.py` | 11 | the HTTP service: **a full run with remote human approvals** (nothing runs before the plan gate, nothing is released before the release gate, decisions carry the reviewer's identity); rejection blocks release; an **unattended gate times out as a rejection**; bearer auth; remote callers cannot name filesystem paths |
 | `test_e2e.py` | 16 | whole runs with real generation and validation (below) |

@@ -1,12 +1,12 @@
 # Use case 1: Greenfield. "Build a scalable URL shortener service with APIs, persistence, and analytics."
 
 **Read this first if you are new.** It explains what happens, who does what, how the result is judged, and why each choice was made. The shared
-vocabulary is in [../ARCHITECTURE.md](../ARCHITECTURE.md); how to run and check it is in [../HOW_TO_RUN_AND_VERIFY.md](../HOW_TO_RUN_AND_VERIFY.md).
+vocabulary is in [../ARCHITECTURE.md](../ARCHITECTURE.md); how to run and check it (including shortening your own URL) is in the [root README](../../README.md#5-prerequisites-and-quick-start); advanced runs and demos are in [../HOW_TO_RUN_AND_VERIFY.md](../HOW_TO_RUN_AND_VERIFY.md).
 
 | | |
 |---|---|
 | **Input** | one sentence of requirement, no existing code |
-| **Command** | `python run.py greenfield` (about 9 minutes, about 10 model calls) |
+| **Command** | `python run.py greenfield` (about 9 minutes, about 10 model calls). To test it on **your own URL**: `python run.py greenfield --shorten <url>`: the agents build the service, then the service they built shortens your URL (optionally `--alias`, or your own URL-shortener requirement via `--requirement-file`) |
 | **Output** | `output/greenfield/` (open `RUN_STORY.md`, then `DEMO_RESULT.md`, which shows a real long URL shortened by the generated service): `ENGINEERING_SUMMARY.md` (the deliverable), `plan.json`, `events.jsonl`, and `release/` (the service) |
 | **Goal** | show requirement understanding, decomposition, multi-step orchestration, generated code, API contract, tests, and a validation strategy, under human oversight |
 
@@ -116,7 +116,7 @@ and that the router equals the OpenAPI document. File names and counts differ fr
 are retried with backoff; an optional task failing degrades instead of blocking; a fatal failure skips dependents and releases nothing; resume re-runs only what failed; a human veto at either gate releases nothing;
 injection text in the requirement is flagged and not obeyed; and the released service really starts as a subprocess and answers requests (`tests/test_e2e.py`, `tests/test_harness.py`).
 
-**Check it yourself:** `python scripts/verify_outputs.py greenfield`, then run the service and call it (see HOW_TO_RUN_AND_VERIFY section 3).
+**Check it yourself:** `python scripts/verify_outputs.py greenfield`, or run `python run.py greenfield --shorten <your url>` and open the short URL it prints (README, "Test greenfield on any URL").
 
 ## 5. Decisions and why
 
@@ -144,5 +144,5 @@ new test now blames both sides.
 
 ## 7. Limits
 
-Not reproducible end to end (the model writes the plan, code and tests; the committed output is one run). SQLite and the in-process cache and limiter are single-node. Capacity numbers are assumptions.
-The validator proves "consistent and tested", not "right for the business".
+Not reproducible end to end (the model writes the plan, code and tests; the committed output is one run), and a run can still end `failed` if the model's output is rejected after the bounded retries. SQLite and the in-process cache and limiter are single-node.
+Capacity numbers are assumptions. The validator proves "consistent and tested", not "right for the business". The general limits are in [../ARCHITECTURE.md](../ARCHITECTURE.md), section 12.

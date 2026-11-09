@@ -20,6 +20,61 @@ the gates) is plain Python. So any model that can do that works, and you choose 
 
 `.env` holds secrets. Do not commit it or paste it into chats (the repository's `.gitignore` should list it; check with `git check-ignore .env` if you use git).
 
+**File format.** One `KEY=value` per line, no quotes needed (quotes are stripped if you add them). Blank lines and lines starting with `#` are ignored. A value that still starts with `<` (an unfilled placeholder) counts as **not set**. A variable already set in your shell is **not** overridden by `.env`, so if a run uses the wrong model, check `echo $env:AGENTIC_PROVIDER` and the other variables in your PowerShell session.
+
+### Complete `.env` examples (copy one, replace the values)
+
+**Azure AI Foundry / Azure OpenAI** (the setup the system was verified with). The deployment name is the name you gave the deployment, not the model family. Omit the key to use `az login`:
+
+```
+AZURE_AI_ENDPOINT=https://my-resource.services.ai.azure.com
+AZURE_AI_DEPLOYMENT=my-deployment-name
+AZURE_AI_API_KEY=xxxxxxxxxxxxxxxx
+```
+
+**Anthropic (Claude) API key:**
+
+```
+AGENTIC_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxx
+AGENTIC_MODEL=claude-sonnet-5-5
+```
+
+**OpenAI API key:**
+
+```
+AGENTIC_PROVIDER=openai
+AGENTIC_BASE_URL=https://api.openai.com/v1
+AGENTIC_MODEL=<a current chat model id from your account>
+AGENTIC_API_KEY=sk-xxxxxxxxxxxxxxxx
+```
+
+**OpenRouter or GitHub Models** (the same shape; only the URL, model id and key change. Take the exact URL, model id and token scope from the provider's current documentation):
+
+```
+AGENTIC_PROVIDER=openai
+AGENTIC_BASE_URL=<the provider's OpenAI-compatible base URL>
+AGENTIC_MODEL=<a model id from the provider's catalog>
+AGENTIC_API_KEY=<your key or token>
+```
+
+**A local model, no cloud and no key** (Ollama shown; LM Studio and vLLM only change the URL and port):
+
+```
+AGENTIC_PROVIDER=openai
+AGENTIC_BASE_URL=http://localhost:11434/v1
+AGENTIC_MODEL=<the model name you pulled>
+```
+
+**A tool's command line** (see section 3 for the risks):
+
+```
+AGENTIC_PROVIDER=command
+AGENTIC_LLM_COMMAND=powershell -NoProfile -File C:\tools\ask.ps1
+```
+
+Then run `python scripts/model_smoke.py`.
+
 ## 2. Providers you can use (pick the one you already have)
 
 | You have | Provider | What to put in `.env` | Verified here? |
@@ -85,7 +140,7 @@ models through GitHub Models.
 
 | Goal | How | Needs a model? |
 |---|---|---|
-| Prove the framework works end to end, including fault injection and the policies | `python -m unittest discover -s tests -t .` (266 tests, about 5 minutes) | No (scripted stand-in) |
+| Prove the framework works end to end, including fault injection and the policies | `python -m unittest discover -s tests -t .` (273 tests, about 5 minutes) | No (scripted stand-in) |
 | Read real results of every scenario | open the committed `output/<scenario>/ENGINEERING_SUMMARY.md` (if you kept it) | No |
 | Re-check committed outputs | `python scripts/verify_outputs.py` (re-runs each release's own tests) | No |
 | Run the generated URL shortener | `cd output/greenfield/release; python -m shortener.server --port 8080` | No |

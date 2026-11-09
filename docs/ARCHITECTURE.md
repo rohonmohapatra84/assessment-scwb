@@ -1,462 +1,250 @@
-# Architecture and design
+# Architecture: what was built and why
 
-The single design document. It explains the system as a whole; each use case then has its own page ([usecases/](usecases/)). If you are new, read the
-[root README](../README.md) first for the problem and the use cases, then this page, then the use case you care about.
+Read the [root README](../README.md) first for the problem and how to run things. This page explains the design in plain language. Each use case then has its own page in [usecases/](usecases/).
 
-**Vocabulary used everywhere**
+## 1. What this is
+
+A system that takes a **software requirement** and returns a **reviewable engineering result**: a plan, code, an API contract, tests, documentation and a summary. It is not a chatbot.
+Four models do the creative work (planning, writing code, writing tests). Plain Python decides what they are allowed to do, checks what they produce, and a human approves the important moments.
+
+**The one idea: models propose, the harness decides.**
+
+- **Models are untrusted.** They can be wrong, flaky, or steered by the text they are given.
+- **Quality is measured by running things**, never by asking a model "does this look right?": parse the code, run the tests, diff the API, drive the service, run new tests against the old code.
+- **Humans own the irreversible decisions**: approve the plan before work starts, approve the validated result before anything is released.
+- **Every claim has evidence in a file** (`events.jsonl`, `state.json`, `ENGINEERING_SUMMARY.md`).
 
 | Term | Meaning |
 |---|---|
-| **Lead agent** (`project_lead`) | a model that proposes the task plan and, each turn, picks which ready tasks start. It can only choose; it cannot write files or approve anything |
-| **Harness** | plain Python that owns everything with consequences: plan checking, permissions, the sandbox, retries, repair, validation, the human gates, release |
-| **Agent** | a model with a role, limits and a prompt, defined in `agentic/agents/*.md`. There are four: `project_lead`, `requirement_analyst`, `code_author`, `spec_tester` |
-| **Step** | a deterministic Python work unit (`agentic/steps/`): design, analysis, docs, validation. Not an agent: no model call |
-| **Tool** | the name a plan uses for an agent or a step. The **tool catalog** (`harness/tools.py`) says what each tool needs, provides, may write and may do |
-| **Task** | one use of a tool in a plan: an id, a tool, the tasks it waits for |
-| **Blackboard** | the shared record of facts (`contract`, `schema`, `code`, `tests`, ...) that tasks publish and consume. Workers never call each other |
-| **Gate** | a point where a human must approve: plan, an amended existing test, release |
+| **Agent** | a model with a role, limits and a prompt, written as a Markdown file in `agentic/agents/`. There are four |
+| **Step** | a deterministic Python unit (`agentic/steps/`): design, analysis, docs, validation. No model call, so it is reproducible and unit-tested |
+| **Harness** | the Python that owns everything with consequences: plan checking, permissions, the sandbox, retries, validation, the human gates, release |
+| **Blackboard** | the shared record of facts (`contract`, `schema`, `code`, `tests`...) that tasks publish and read. Workers never call each other |
+| **Gate** | a point where a human must approve: the plan, an amended existing test, the release |
 
----
+## 2. A run, start to finish
 
-## 1. The idea in 60 seconds
+```mermaid
+flowchart LR
+  REQ["Requirement<br/>(+ existing code)"] --> DISC["1. Discover<br/>understand the request"]
+  DISC --> LEAD(["2. Lead agent<br/>proposes a task plan"])
+  LEAD --> CHK["3. Harness checks the plan"]
+  CHK -- "rejected, with the reason" --> LEAD
+  CHK --> G1{{"Human gate:<br/>approve the plan"}}
+  G1 --> BUILD["4. Build<br/>agents and steps run in parallel"]
+  BUILD --> VAL["5. Validator<br/>executes the checks"]
+  VAL -- "findings go back to the<br/>responsible task" --> BUILD
+  VAL --> G2{{"Human gate:<br/>approve the release"}}
+  G2 --> OUT["6. release/ and<br/>ENGINEERING_SUMMARY.md"]
+  OUT -.-> USE["7. Optional: use it<br/>(shorten your URL)"]
+```
 
-The assessment asks for an agentic system that takes a requirement to a reviewable engineering outcome under **controlled autonomy**. The thesis:
+1. **Discover.** Rules read the requirement: what is being asked, is it vague? A vague request (for example "faster and more secure", no numbers) **pauses with questions and generates nothing** until a human answers. If there is existing code, an `ast` analysis finds the modules, routes, tables and impact, and the existing test suite is run before anything is touched.
+2. **Plan.** The lead agent proposes tasks with dependencies, for example *design contract, then write code and write tests in parallel, then validate*.
+3. **Check.** The harness rejects the plan, with the exact reason, if it breaks a rule: an unknown tool, a missing input, a cycle, two tasks writing the same file, or no validator at the end. Three rejected plans stop the run. There is no hidden offline plan: no model, no run.
+4. **Build.** Ready tasks run in parallel (the lead picks which to start). Agents write only through the sandbox, into the paths their tool is allowed to touch.
+5. **Validate.** The validator runs the checks (section 5). A failure names the *role* responsible (code, tests, contract) and that producer re-runs with the findings quoted back, a bounded number of times.
+6. **Release.** Only after a human approves are files copied into `release/`, with an `ENGINEERING_SUMMARY.md` (plan, rationale, evidence, risks, approvals, limits).
+7. **Use it (optional).** `python run.py greenfield --shorten <url>` takes the released service and shortens your URL with it (section 8).
 
-1. **Models are untrusted producers.** They may be wrong, flaky or manipulated by the input text.
-2. **A model chooses structure and order; the harness owns permissions, verification and release.** The lead plans, but `check_plan` rejects any plan that breaks a catalog rule, and write scopes always come from the catalog.
-3. **Quality is measured by executing things**: parse the AST, run the tests, diff the API, drive the service black-box, run the new tests against the old code. Never "does this look right?" asked of a model.
-4. **Humans own the irreversible decisions**: approve the plan before work starts, approve any amended existing test, approve the validated result before release.
-5. **Every claim has evidence in a file:** `events.jsonl` (audit), `state.json` (checkpoint), `ENGINEERING_SUMMARY.md` (the deliverable).
+## 3. Who does what
 
-It is not a chatbot or a prompt in a loop, and it is not free-form agents chatting. The model does the creative work inside a frame the harness enforces.
+**Four agents (models).** Each is a Markdown file (role, responsibilities, guardrails, failure handling, system prompt) so its behaviour can be reviewed without reading code. The file *describes*; the harness *enforces*: the Markdown cannot grant a permission.
 
-## 2. The system at a glance
+| Agent | What it does | What it cannot do |
+|---|---|---|
+| `project_lead` | proposes the task plan; each turn picks which ready tasks start | write files, widen a permission, approve anything |
+| `requirement_analyst` | rules find vague terms and classify the request; the model may only **add** questions | remove or change a rule-based result |
+| `code_author` | writes the whole service (new work) or minimal anchored edits (a change) | edit tests, write outside `shortener/*`, `openapi.json`, `schema.sql`, `changes.diff` |
+| `spec_tester` | writes tests from the **specification only**, never seeing the code | read the code; edit an existing test, except one narrow human-approved case |
 
-Five layers; each only calls the one below it.
+**Steps (plain Python, no model).** Architecture decisions, the OpenAPI contract and database schema, the risk register and test strategy, codebase analysis, documentation, the validator and the summariser. They are deliberately **not** called agents.
+
+**Why the split.** A model is used where judgement is needed. Everything that must be reproducible, testable and trustworthy is code.
+
+**Coordination.** Agents never call each other. Tasks publish facts to the blackboard and others wait for them. The test author waits for the API contract the code author publishes but never sees the code, so the tests are an **independent** check.
+
+## 4. How the harness keeps models in check
+
+| Risk | Guardrail |
+|---|---|
+| A bad or over-powerful plan | `check_plan` against the **tool catalog** (`harness/tools.py`), a data file that says what each tool needs, provides and may write. The model cannot edit it |
+| An agent writes where it should not | per-task write scopes from the catalog, a path jail, an extension allow-list, 200 KB per file and 200 files |
+| Secrets in generated code | the same pattern scan in three places: on the model's reply before writing (so it can fix it), on every write (the hard stop), and again in the validator |
+| Unusable model output (bad shape, syntax error, NUL byte, secret-like text) | checked before writing; the **same task retries with the exact problems quoted back** |
+| Untrusted code execution | tests run in a subprocess: hard timeout, isolated mode, environment scrubbed to a few variables |
+| Damaging the customer's repo | edits happen on a workspace copy; a pristine `baseline/` is kept |
+| An agent rewriting the tests that judge it | existing tests are protected (section 6) |
+| Runaway loops | bounded plan attempts, lead turns, task attempts and repair rounds |
+| Unreviewed release | `release/` is written only after the release gate |
+| Prompt injection | the requirement is data, screened and flagged, never obeyed; model output is parsed defensively |
+
+**Human gates** (`harness/approvals.py`): `plan_approval` (before any work), `test_update_approval` (only if an agent amended an existing test, showing every diff), `release_approval` (after validation). Modes: `interactive` (you type y/n), `auto` (approves only when nothing blocks; for CI and demos, labelled `policy:auto`, **not a review**), `reject` and `reject:<gate>`. Every decision is recorded with who made it.
+
+## 5. What the validator checks
+
+It executes things and never asks a model. Each finding names a role, and the harness maps the role to whichever tasks the lead's plan contains.
+
+| Check | What it runs |
+|---|---|
+| `static` | `ast.parse` every `.py`, secret scan, required files |
+| `probe` | a black-box behavioural probe of the public interface (create, redirect, not found, bad input, conflict, stats, delete, restart persistence), then checks the real database against the designed schema |
+| `tests` | the whole test suite in an isolated subprocess |
+| `regression` | the baseline stays green; the suite grows (or does not shrink); for a bug fix, **new tests must fail on the old code** |
+| `compat` | OpenAPI diff: removing or breaking anything is rejected; a refactor or tests-only change must leave it **identical** |
+| `traceability` | every acceptance criterion maps to a real test function |
+| `scope` | a tests/docs-only change wrote no production file |
+
+**The kind of change decides what is allowed and proved**, detected from the wording of the request:
+
+| Kind | Tools offered | Additionally required |
+|---|---|---|
+| enhancement | code, tests, docs | suite grows; API additive only |
+| bug fix | same | green after the fix; **new tests fail on the unfixed code** |
+| refactor | code, docs | suite not smaller; API identical |
+| tests / docs | tests and docs only (the code agent is not offered) | no production file written; API identical |
+
+## 6. Keeping the tests honest
+
+The model writes both the code and the tests, so the harness stops either from quietly weakening the other.
+
+**A. Approved test updates.** An agent may not edit a test it did not write. One exception exists because a live enhancement run hit a real problem: a baseline test pinned the entire OpenAPI document, so any contract change broke it and no agent was allowed to touch it. The narrow exception: only `spec_tester`, only in an enhancement, only after a validation failure, only if the contract really changed, and only if a **count** shows the suite did not get weaker (no test removed, no assertion lost, nothing skipped, valid Python, at most five edits). The validator then compares every baseline test on disk with the pristine copy, and the `test_update_approval` gate shows a human each diff and reason. The count cannot judge a subtly wrong new expectation; the human gate is the backstop.
+
+**B. Bug-fix proof.** A regression test is evidence only if it fails on the bug. The validator copies the pristine buggy code to a temporary folder, adds the new tests and runs them: at least one must fail by assertion, then all must pass on the fix. If the tests also pass on the buggy code, the check fails and blames the tests.
+
+## 7. When something goes wrong
+
+```mermaid
+flowchart LR
+    F["Failure"] --> W{"Which?"}
+    W -- "bad plan" --> P["rejected with the reason, lead retries 3 times, then plan_rejected"]
+    W -- "unusable model output" --> SC["same task retries with the problems quoted back"]
+    W -- "flaky provider or network" --> RT["retry with backoff"]
+    W -- "validator finding" --> RP["responsible task re-runs with the findings, bounded rounds"]
+    W -- "optional task fails" --> DG["run completes as completed_degraded"]
+    W -- "required task fails" --> SK["dependents skipped, nothing released"]
+    W -- "human says no" --> VT["stop at the gate, nothing released"]
+    W -- "model provider down" --> LP["run stops and says so"]
+```
+
+| Error type | The loop's response |
+|---|---|
+| `TransientError` | retry with exponential backoff |
+| `ValidationFailure` from a producer (its own pre-check) | self-correct with the findings; counts as an attempt |
+| `ValidationFailure` from the validator | repair loop: the blamed producers and their dependents re-run (3 rounds with a model) |
+| `GuardrailViolation`, `FatalError` | fail now, never retried |
+| any other exception | contained: that task fails, the run continues, the traceback is logged |
+
+A hard dependency that failed means the dependent is **skipped**. `--resume` re-runs only the tasks that did not succeed. The lead is asked again after a bad decision and, after two bad answers, the harness starts all ready tasks itself and logs `lead_fallback`.
+
+**The rule we apply:** anything a model can get wrong and fix on a second attempt must be *feedback*, not a fatal error; the guardrails stay as the hard stop behind it. Two live runs died before this rule covered everything: a reply with a NUL byte (Python below 3.12 raises `ValueError`, not `SyntaxError`, from `ast.parse`) and a test file containing `token = "abcdefgh12"` (rejected only at write time). Both are now caught before writing and fed back.
+
+## 8. The three use cases and how a user tests them
+
+| Use case | What happens | The user's own test | What proves it worked |
+|---|---|---|---|
+| **Greenfield** | build the URL shortener from a requirement | `python run.py greenfield --shorten <url>` (optionally `--alias`, or their own URL-shortener requirement via `--requirement-file`) | status `completed`; a `302` redirect back to exactly that URL; the generated tests green; the plan, validation evidence and approvals in `ENGINEERING_SUMMARY.md` |
+| **Brownfield** | change the existing service: bug fix, enhancement, refactor, tests-only | plant a bug yourself in a copy (five ready-made bugs in `input/brownfield/bugs/`), then `python run.py brownfield --repo <copy> --requirement-file <bug report> --verify` | the new tests fail on the buggy copy and pass on the fix; the suite is green; `changes.diff` is small |
+| **Ambiguous** | a vague request pauses with questions, then (given answers) produces a proposal, not code | `python run.py ambiguous`, then `--answers` or `--assume-defaults` | no `release/` after step 1; after step 2 a `PROPOSAL.md` with measurable objectives, options and trade-offs, and a gap analysis against the existing code |
+
+**What `--shorten` does.** After a run that ends `completed`, the CLI hands the **released** `release/` (never the workspace) to `scripts/shorten_url.py`. It starts the service from a temporary copy on `127.0.0.1` with a throwaway database, shortens your URL through the public API, checks that the redirect equals your URL, reads the analytics and leaves the service running so the short URL opens in a browser until Ctrl+C (`--once` stops it at once). It sits outside the harness: it cannot change a verdict, and it is skipped with the reason if nothing was released. It never replaces the agents: the service exists only because they built, tested and released it in the same command.
+
+**Brownfield, honestly.** The agents do **not** discover bugs: a person reports the symptom in plain English and the agents work out where it lives, fix it minimally, and the validator proves it. Without `--repo`, `python run.py brownfield` plants one built-in bug (`scripts/seed_bug.py`) for a no-effort run.
+
+## 9. How the code is laid out
+
+Five layers; each builds on the one below.
 
 ```mermaid
 flowchart TB
-  subgraph L1["1. Interfaces"]
-    CLI["run.py (CLI)"]
-    API["agentic/api.py (HTTP, remote gates)"]
+  subgraph L1["1. INTERFACES: how you start a run"]
+    direction LR
+    CLI["run.py<br/>command line"]
+    API["agentic/api.py<br/>HTTP, remote approval gates"]
   end
-  subgraph L2["2. Harness: agentic/harness/ (deterministic, enforces every rule)"]
-    H["harness.py<br/>discover, plan, gates, release"]
-    LD["lead.py<br/>ModelLead + check_plan"]
-    LP["loop.py<br/>ready tasks, parallelism, retry, repair, resume"]
-    AP["approvals.py<br/>the human gates"]
-    RP["report.py<br/>engineering summary"]
-    NR["narrator.py<br/>RUN_STORY.md, written live"]
-    TL["tools.py<br/>the tool catalog (permissions as data)"]
+
+  subgraph L2["2. HARNESS: agentic/harness/ (plain Python, owns every rule)"]
+    direction LR
+    HA["harness.py<br/>the flow"]
+    LD["lead.py<br/>plan + plan check"]
+    LP["loop.py<br/>parallel execution,<br/>retry, repair"]
+    TL["tools.py<br/>tool catalog<br/>(permissions as data)"]
+    AP["approvals.py<br/>human gates"]
+    RP["report.py + narrator.py<br/>summary + RUN_STORY.md"]
   end
-  subgraph L3["3. Workers"]
-    AG["Agents (models): agentic/agents/*.md + authoring_agents.py<br/>project_lead, requirement_analyst, code_author, spec_tester"]
-    ST["Steps (Python): agentic/steps/<br/>analysis, design, build (docs), validate"]
+
+  subgraph L3["3. WORKERS: do the actual work"]
+    direction LR
+    AG["4 AGENTS (models)<br/>agentic/agents/*.md<br/>+ authoring_agents.py<br/>lead, requirement analyst,<br/>code author, spec tester"]
+    ST["STEPS (plain Python)<br/>agentic/steps/<br/>design, analysis,<br/>docs, validator, summariser"]
   end
-  subgraph L4["4. Guardrails: guardrails.py"]
-    WS["Workspace: path jail, write scopes, extension allow-list,<br/>size caps, secret scan, protected tests"]
-    RT["run_unittests: isolated subprocess, timeout, scrubbed env"]
+
+  subgraph L4["4. GUARDRAILS: guardrails.py (every file passes through here)"]
+    direction LR
+    WS["Workspace sandbox<br/>path jail, write scopes,<br/>extension allow-list, size caps,<br/>secret scan, protected tests"]
+    RT["Isolated test runner<br/>subprocess, timeout,<br/>scrubbed environment"]
   end
-  subgraph L5["5. Models: providers.py"]
-    PV["one contract: complete_json(system, prompt)<br/>azure | openai-compatible | anthropic | command"]
+
+  subgraph L5["5. MODELS: providers.py"]
+    direction LR
+    PV["one call: complete_json(system, prompt)<br/>azure | openai-compatible | anthropic | command"]
   end
+
   L1 --> L2
-  H --> LD
-  H --> LP
-  H --> AP
-  LP --> AG
-  LP --> ST
-  AG --> WS
-  ST --> WS
-  ST --> RT
+  L2 --> L3
+  L3 --> L4
   AG --> PV
   LD --> PV
   TL -. "rules" .-> LD
   TL -. "rules" .-> LP
 ```
 
-### 2.1 One run, end to end
+Read it top to bottom: you start a run (1); the harness decides the flow and enforces the rules (2); workers do the work (3); everything a worker writes or runs goes through the guardrails (4); only agents and the lead reach a model (5), and the harness treats whatever comes back as untrusted.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor H as Human
-    participant HA as Harness
-    participant L as project_lead (model)
-    participant S as Steps and agents
-    participant V as Validator
+The model layer knows nothing about this project, and no agent file names a vendor (a test enforces it). The model's reply is parsed defensively, path-filtered, size-capped and syntax-checked, and every file goes through the sandbox. `python scripts/model_smoke.py` checks the connection first.
 
-    H->>HA: requirement (+ optional repo)
-    HA->>HA: discover: analyse requirement, model the codebase, run baseline tests
-    alt vague requirement
-        HA-->>H: questions (clarifications.json), nothing generated
-        H->>HA: answers
-    end
-    loop up to 3 attempts
-        HA->>L: plan request (requirement, facts, tool catalog, limits)
-        L-->>HA: tasks with tools and dependencies
-        HA->>HA: check_plan (tools, needs, cycles, write conflicts, validator last)
-    end
-    HA->>H: plan gate (tasks, tools, waves, rationale)
-    H-->>HA: approve
-    loop until nothing is left to run
-        HA->>L: ready tasks, running tasks, free slots (only if there is a real choice)
-        L-->>HA: start these
-        HA->>HA: refuse anything not ready or over the limit
-        HA->>S: run in parallel (sandbox, write scopes, retry with backoff)
-    end
-    HA->>V: validate (execute checks)
-    alt findings
-        V-->>HA: findings blame a ROLE (code, tests, contract)
-        HA->>S: re-run the blamed producers with feedback (max 3 rounds with a model)
-    end
-    opt an existing test was amended
-        HA->>H: test-update gate (every diff and reason)
-        H-->>HA: approve
-    end
-    HA->>H: release gate (validation evidence)
-    H-->>HA: approve
-    HA-->>H: release/ and ENGINEERING_SUMMARY.md
-```
+`agentic/api.py` and `infra/` deploy the harness to Azure Container Apps with remote approval gates (see [AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md)); this has not been tried in Azure.
 
-### 2.2 How a request becomes a plan shape
+## 10. Key decisions and why
 
-```mermaid
-flowchart TD
-    IN["Requirement + optional repo"] --> R{"Repo given?"}
-    R -- no --> D{"Known domain?"}
-    D -- yes --> GF["greenfield<br/>design, contract, schema, risks, strategy, code, tests, docs, validate"]
-    D -- no --> AN
-    R -- yes --> A{"Vague after analysis?"}
-    A -- yes --> Q["ask questions"] --> AN["analysis<br/>measurable objectives, options, trade-offs, proposal"]
-    A -- no --> K{"Change kind"}
-    K --> E["enhancement<br/>code_author + spec_tester"]
-    K --> B["bugfix<br/>code_author + spec_tester (regression test must fail on the old code)"]
-    K --> RF["refactor<br/>code_author, API must stay identical"]
-    K --> TD["tests_docs<br/>spec_tester and doc_writer only<br/>no production file may change"]
-```
+| Decision | Why | Cost |
+|---|---|---|
+| The model plans; the harness checks the plan | real decomposition without trusting a model with permissions | a bad plan costs a retry; runs are not reproducible end to end |
+| Rules live in a data catalog | a reviewer can read what each tool may do; a prompt cannot override it | the catalog must stay in step with the steps (a test enforces it) |
+| Tests come from the spec, never from the code | an independent oracle: the author cannot grade its own work | needs a good contract |
+| Deterministic steps around the models | design, validation and the sandbox stay testable | an offline reference generator exists, for the test suite only |
+| Human gates, no auto-release | the irreversible steps stay with a person | slower than full automation |
+| Existing tests protected, one counted and human-approved exception | an author must not edit its own judge, yet a contract change can make a test obsolete | a count cannot judge a subtly wrong expectation; the human gate does |
+| Everything bounded (plan tries, lead turns, attempts, repairs) | the loop always ends and cost is capped | a hard case ends as `failed`, not "keep trying" |
 
-### 2.3 What happens when something goes wrong
+## 11. Assignment requirements: where each is met
 
-```mermaid
-flowchart LR
-    F["Failure"] --> W{"Which?"}
-    W -- "bad plan" --> P["rejected with the reason, lead retries (max 3), then plan_rejected"]
-    W -- "bad lead decision" --> LD["asked again once, then harness starts all ready tasks (logged)"]
-    W -- "model provider down" --> LP["run stops and says so, no hidden offline plan"]
-    W -- "transient task error" --> RT["retry with backoff"]
-    W -- "validator finding" --> RP["blamed producers re-run with feedback (max 3 with a model)"]
-    W -- "optional task fails" --> DG["run completes degraded"]
-    W -- "required task fails" --> SK["dependents skipped, nothing released"]
-    W -- "human says no" --> VT["stop at the gate, nothing released"]
-```
-
-## 3. How an agent is designed
-
-An **agent** is a model with a role, limits and a prompt. It is defined by a Markdown file, `agentic/agents/<name>.md`, so its behaviour can be read and
-reviewed without reading code. A file has a header of facts and five sections:
-
-```
----
-name: spec_tester            <- must match the registered worker (a test checks this)
-title: Spec Tester
-kind: llm | hybrid           <- llm = a model writes artifacts; hybrid = rules do the work, a model may only ADD to the result
-stage: understand | plan | build
-plans: [greenfield, llm_change]      <- which plan types may use it
-inputs: [...]   outputs: [...]       <- facts it reads and publishes on the blackboard
-writes: [tests/*, tests/test_change_*.py]   <- documentation of its write scope
----
-## Role              what it is for
-## Responsibilities  what it does, step by step
-## Guardrails        what it may not do (enforced by code, not by this text)
-## Failure handling  what happens when it fails
-## System prompt     the only text that reaches the model as its system message
-```
-
-**The file describes; the harness enforces.** The Markdown cannot grant permission: write scopes come from the tool catalog, and every file an agent produces goes through the sandbox.
-Only the *System prompt* section reaches a model. `agent_specs.py` loads and validates the files; `python run.py agents` checks they match the registered workers; a test fails if a file names a vendor.
-
-| Agent | Kind | Stage | Reads | Produces | Cannot |
-|---|---|---|---|---|---|
-| `requirement_analyst` | hybrid | understand | the raw text | the normalised requirement, ambiguities, assumptions | remove or change a rule-based result (the model may only add up to 3 questions) |
-| `project_lead` | llm | plan | requirement, tool catalog, facts available, run state | the task plan; which ready tasks start | write files, widen a permission, approve anything |
-| `code_author` | llm | build | contract, schema, ADRs, interface spec (greenfield); the code, impact and failing tests (change) | a whole service, or anchored edits with a changed `openapi.json` | edit tests, write outside `shortener/*`, `openapi.json`, `schema.sql`, `changes.diff` |
-| `spec_tester` | llm | build | spec, acceptance criteria, the **published contract** (never the code) | `tests/*` (greenfield) or `tests/test_change_*.py` (change) | read the code; edit an existing test, except one narrow human-approved case |
-
-**What a worker looks like in code.** Agents and steps share one contract, so the loop treats them the same:
-
-```python
-class Worker:
-    name: str                              # the tool name a plan uses
-    def run(self, ctx) -> dict: ...        # ctx: the task, blackboard, scoped workspace, event log, model, repair feedback
-```
-
-A worker reads facts from `ctx.bb`, writes only through `ctx.write(path, content, kind)` (sandbox, scope, scan), and signals trouble with a typed error that tells the loop how to recover:
-
-| Error | Loop's response |
+| Requirement | Where to see it |
 |---|---|
-| `TransientError` | retry with backoff |
-| `ValidationFailure` (from a producer) | self-correct with the findings, counts as an attempt |
-| `ValidationFailure` (from the validator) | repair loop: blamed producers re-run with the findings |
-| `FatalError`, `GuardrailViolation` | fail now, never retried |
-
-**Agents versus steps, and why the split.** The model-backed agents (`code_author`, `spec_tester`, `project_lead`, `requirement_analyst`) are where judgement is needed. Everything that must be
-reproducible and unit-testable is a step: the architecture decisions, the OpenAPI contract and schema, risk register, validation strategy, the codebase model, documentation, the validator and the summariser.
-Steps are never called agents in this project; the summary's plan table marks only model-backed tasks with **(model)**.
-
-**Where the Python behind each agent lives:** `harness/lead.py` (`ModelLead`, `check_plan`), `steps/analysis.py` (`RequirementAnalyst`, rule-based with the model seam), `authoring_agents.py` (`CodeAuthor`, `SpecTester`:
-prompt building, reply parsing, output bounds, the amendment proposal).
-
----
-
-## 4. The control flow in prose
-
-1. **Discover.** Rule-based requirement analysis: finds vague terms, classifies the request. Vague with no numeric target pauses and asks questions (`clarifications.json`); nothing is generated until a human answers.
-   With a repo: an `ast` model of the code and an impact analysis; the baseline test suite is run before anything is touched.
-2. **Plan.** The lead proposes `{"tasks": [{id, tool, title, deps}]}`. `check_plan` rejects it, with the exact reason, unless: every tool is in the catalog for this plan type and change kind; each tool is used at most once;
-   every fact a tool *needs* is provided by something it depends on; no cycle; no two concurrent tasks can write the same path; exactly one validator that waits for everything and one summarizer after it. Write scopes,
-   retry budgets and "may fail without blocking" come from the catalog. Three rejected plans stop the run (`plan_rejected`). **No offline fallback plan exists**: no model, no run.
-3. **Plan gate.** A human sees tasks, tools, waves and the lead's rationale and approves or rejects.
-4. **Loop.** Whenever tasks are ready the lead picks which to start (at most the free worker slots). The harness refuses anything not ready or over the limit and asks again; after two bad answers it starts everything
-   ready itself and logs `lead_fallback`. When only one task is ready there is no decision, so no model call. Lead consultations are bounded.
-5. **Validate.** The validator executes its checks (see section 5.6). Each finding names a **role**; the harness maps the role to whichever tasks the lead's plan contains. The blamed producers re-run with the findings
-   as feedback (max 3 rounds with a model).
-6. **Test-update gate (only when needed).** If an agent amended an existing test, a human sees every diff and its reason. Rejecting it releases nothing.
-7. **Release gate.** A human approves the validated result. Only then are files promoted to `release/`.
-
-
-## 5. Components in depth
-
-### 5.1 Discover (before any planning)
-
-**Requirement analyst** (`steps/analysis.py`, spec `agents/requirement_analyst.md`). Pipeline: screen, classify, detect ambiguity, resolve or pause, normalise.
-
-1. **Screen.** Control characters stripped, 2,000-character cap, injection patterns (`ignore previous instructions`, `rm -rf`, `api key`...) flagged and logged as a `guardrail_hit`. The text is data; classification never reads instructions from it.
-2. **Classify.** The *plan type* (greenfield, change to existing code, analysis) and, for a change, the **kind**: `enhancement`, `bugfix`, `refactor` or `tests_docs`. The kind later decides which tools are offered and what the validator demands (section 5.6).
-3. **Detect ambiguity.** A vague term only counts when the text has **no numeric target**. Blocking = two or more vague terms without numbers, or no domain and under eight words. One vague term in a recognised domain is not blocking: it becomes a documented, low-confidence assumption flagged `needs_confirmation`. That is why "scalable URL shortener" proceeds and "faster and more secure" pauses.
-4. **Resolve or pause.** `--answers` or `--assume-defaults` resolve each question and are recorded. Otherwise the run writes `clarifications.json`, emits `run_paused` and **generates nothing**.
-5. **Normalise** into capabilities, NFRs, acceptance criteria and a problem statement.
-6. **Model seam.** The model may add up to three extra questions; the reply is parsed defensively and capped. It can only add.
-
-*Why a lexicon and not a model?* Reproducible, testable, fails predictably. The model seam shows where judgement plugs in and how its output is contained.
-
-**Codebase analyst** (`steps/analysis.py`). With a target repo it builds a system-level model with `ast`:
-
-| Fact | How |
-|---|---|
-| Modules, classes, functions | walk every `.py` |
-| Internal import graph | `from .x import` and `from shortener.x import` |
-| HTTP routes | decorator routes |
-| SQL tables read and written | only inside string literals that start with a SQL verb |
-| Call graph | receiver-aware (`self.x` stays in the class; `app.service.create_link` resolves to the service) so the three functions named `create_link` are not confused |
-| Data flow | route handler, call chain, tables read and written |
-
-Impact analysis has two tiers: `modules` (must change) and `flow_modules` (on the flow, re-tested, not edited), plus the tests that exercise them. It recognises decorator routes and SQL literals only; on a service built another way it finds nothing, and the code author is then shown every module that fits the prompt (`analysis_blind`).
-
-The baseline test suite is run **before anything is touched** and recorded: it is the regression reference.
-
-### 5.2 The lead agent, the plan check and the tool catalog
-
-The lead (`agents/project_lead.md`, `harness/lead.py`) is shown the requirement and the catalog of tools it may use, and answers with a plan: `{"tasks": [{"id", "tool", "title", "deps"}], "rationale"}`. The decomposition is the model's; the **rules** are data in `harness/tools.py`:
-
-| Catalog field | Rule it carries |
-|---|---|
-| `needs` | facts that must exist before the tool may start (an upstream task or discovery provides them) |
-| `provides` | facts it publishes, and the ROLES a validator finding can blame (`code`, `tests`, `contract`...) |
-| `writes` | the only paths it may write; the model cannot widen this |
-| `plans`, `generator`, `not_for_kinds` | where the tool is offered at all (`tests_docs` hides `code_author`) |
-| `optional_in` | where failure degrades the run instead of blocking it |
-| `amends_tests` | the change kinds where the tool may propose edits to EXISTING tests (only `spec_tester`, only `enhancement`) |
-
-`check_plan` rejects a plan, with the exact reason, unless: every tool exists for this plan type and kind; each tool is used once; every `needs` is provided by a dependency; no cycle; no two concurrent tasks can write the same path; there is exactly one validator that waits for everything and one summarizer after it. A rejected plan goes back to the lead with the reason, three attempts, then the run stops (`plan_rejected`). There is **no hidden offline plan**: no model, no run.
-
-A real greenfield plan (from `output/greenfield/plan.json`): `design_architecture`, then `design_contract` and `design_schema` in parallel, then `assess_risks` and `implement_service`, then `plan_validation`, then `write_spec_tests` and `write_documentation`, then `validate_service`, then `summarize_results`: 10 tasks.
-
-### 5.3 The loop (`harness/loop.py`)
-
-Whenever several tasks are ready the lead decides which start (at most the free worker slots). The harness refuses anything not ready or over the limit and asks again; after two bad answers it starts everything ready itself and logs `lead_fallback`. When only one task is ready there is no decision, so no model call. Lead consultations are bounded.
-
-| Error | Meaning | Response |
-|---|---|---|
-| `TransientError` | flaky provider or environment | retry with exponential backoff, up to the tool's `max_attempts` |
-| `ValidationFailure` from a **validator** | output is wrong; findings blame a role | **repair loop**: the blamed producers, their dependents and the validator reset, findings go back as feedback, bounded rounds (3 with a model, 2 otherwise) |
-| `ValidationFailure` from a **producer** | its own pre-check failed | self-correct with its findings, counts as an attempt |
-| `GuardrailViolation`, `FatalError` | unsafe or unrecoverable | fail immediately, never retried |
-| any other exception | an agent bug | contained: task failed, run continues, traceback in the log |
-
-Dependency semantics: a hard dependency that failed or was skipped means the dependent is **skipped** (it never runs on bad inputs); an optional dependency that failed lets the dependent run and the run ends `completed_degraded`; independent branches keep going; `--resume` re-runs only tasks that did not succeed (state is written atomically after every transition).
-
-### 5.4 Guardrails (`harness/guardrails.py`)
-
-| Risk | Guardrail | Enforced where |
-|---|---|---|
-| Path traversal, absolute paths | resolve and containment check | `Workspace._resolve` |
-| Agent writes outside its remit | per-task write scope from the catalog | `Context.write` to `Workspace.write(scopes=)` |
-| Executables dropped in output | extension allow-list | `Workspace.write` |
-| Secrets in generated code | pattern scan on every write, and again in the validator | `Workspace.write`, validator |
-| Resource abuse | 200 KB per file, 200 files | `Workspace.write` |
-| Untrusted code execution | tests run in a subprocess: hard timeout, `-I`, environment scrubbed to `PATH/SYSTEMROOT/TEMP` | `run_unittests` |
-| Mutating the customer's repo | edits happen on a workspace copy; a pristine `baseline/` is kept | `Workspace.import_tree` |
-| **An agent rewriting the tests that judge it** | existing tests are protected; the only door is `Workspace.write_test_update`, and the validator re-checks the disk (section 5.7) | `guardrails.py`, `validate.py` |
-| Runaway loops | bounded plan tries, lead turns, attempts, repair rounds | `loop.py`, `harness.py` |
-| Unreviewed release | `release/` is written only by `promote()` after the release gate | `harness.py` |
-| Prompt injection | requirement is data; flagged; model output parsed defensively | `analysis.py`, `authoring_agents.py` |
-
-### 5.5 Human gates (`harness/approvals.py`)
-
-| Gate | When | What the human sees | If rejected |
-|---|---|---|---|
-| `plan_approval` | after the plan check, before any work | tasks, tools, waves, the lead's rationale | nothing is generated |
-| `test_update_approval` | only if an agent amended an existing test, before release | the **diff of every amended test** and the reason for it | nothing is released |
-| `release_approval` | after validation passes | validation summary, degraded tasks | the workspace stays, `release/` is never written |
-
-Modes: `interactive` (stdin y/N), `auto` (approves only with zero blocking issues; for CI and the demo, labelled `policy:auto`, **not review**), `reject`, `reject:<gate>`. Over HTTP (`agentic/api.py`) the same gates block until a reviewer posts `{approved, by}`, and an unattended gate times out as a rejection. Every decision is recorded with who made it.
-
-### 5.6 The validator (`steps/validate.py`)
-
-It executes; it never asks a model. Each finding names a **role**, and the harness maps the role to whichever tasks the lead's plan contains (the lead chooses ids, so ids cannot be hard-coded).
-
-| Family | What it runs | Blames |
-|---|---|---|
-| `static` | `ast.parse` of every `.py`, secret scan, required files | code |
-| `probe` | a **black-box behavioural probe**: drives the public WSGI interface through the documented flows (201, 302, 404, 400, 409, stats, delete, restart persistence), then checks the database the code actually created against the designed schema | code |
-| `tests` | the whole suite in an isolated subprocess | code, and tests when a NEW test fails (either side may be wrong; the contract arbitrates) |
-| `regression` | baseline green before and after; suite grew (enhancement, bug fix) or did not shrink (refactor, tests/docs); **new tests fail on the old code (bug fix)** | code or tests |
-| `compat` | OpenAPI diff: removed operations, responses or properties, type changes, new required request fields are breaking; refactor and tests/docs must be **identical** | code |
-| `tests.existing_tests_protected` | no baseline test differs from the pristine copy unless the amendment policy allows it | tests |
-| `traceability` | every acceptance criterion maps to a real test function (`test_ac<N>_...`, found by AST) | tests |
-| `scope` | tests/docs changes wrote no production file | code |
-| `plan` (analysis) | ambiguities resolved, objectives measurable, options with trade-offs, verification defined | the options step |
-
-`docs.present` is a warning (documentation is optional), so a missing document degrades the release instead of blocking it.
-
-**The change kind decides what is offered and what is proved:**
-
-| Kind | Tools the lead may use | The validator additionally requires |
-|---|---|---|
-| enhancement | `code_author`, `spec_tester`, docs | suite grows; API additive only; existing tests untouched unless the amendment policy applies |
-| bugfix | same | suite grows; **green after the fix** (the baseline may start red); **new tests fail on the unfixed baseline**; API additive only |
-| refactor | `code_author`, docs (tests optional) | suite not smaller; API identical |
-| tests_docs | `spec_tester`, `doc_writer` only (`code_author` is not offered) | suite not smaller; API identical; no production file written |
-
-### 5.7 Two policies that keep the tests honest
-
-These two came from a real finding: the model writes both the code and the tests, so the harness must stop either from quietly weakening the other.
-
-**A. Approved test updates.** An agent may not edit a test it did not write. The live link-expiry run failed seven times, and the last blocker was a baseline test that pins the whole OpenAPI document: any contract change breaks it, and no agent was allowed to touch it. A rule that blocks every contract change is wrong; a rule that lets the author edit its own judge is worse. The policy in between:
-
-1. Only the `spec_tester` agent, and only in an **enhancement**, may return `test_updates` (path, anchored `find`/`replace`, reason). The catalog says so (`amends_tests`).
-2. It is offered the chance only **after a validation failure** shows an existing test failing, and it is shown that test's source. It never amends pre-emptively.
-3. The harness permits it only if the **OpenAPI contract really changed**. Otherwise a failing existing test is the code's fault and only the code is re-run.
-4. Before writing, and again in the validator, an amendment is checked by **counting**: no test removed, no assertion lost, nothing skipped or marked expected-failure, still valid Python, at most five edits. Not a judgement call.
-5. The write goes through `Workspace.write_test_update`: the target must be an existing baseline `tests/test_*.py`. New tests still go only in `tests/test_change_*.py`.
-6. The validator then compares **every baseline test on disk to the pristine copy**. A modification nobody recorded, or one in any other kind of change, fails `tests.existing_tests_protected`, even if the agent wrote around the API.
-7. Before release, the **`test_update_approval` gate** shows a human each diff and its reason. Rejection means nothing is released. The summary lists every amendment.
-
-**B. Bug-fix proof.** A regression test is evidence only if it fails on the bug. For a bug fix the validator copies the pristine baseline to a temporary folder, adds the new `test_change_*` files, and runs them: at least one must fail **by assertion** (not an import error), then it must pass on the fix. If the tests also pass on the buggy code, the check `regression.fails_on_old_code` fails, blames the tests, and the author is told to assert the correct behaviour the defect violates.
-
-### 5.8 The engineering summary (`harness/report.py`)
-
-Rendered after the release decision, so it can include the approval audit. It contains: requirement understanding, codebase reasoning, plan and rationale with a graph, orchestration evidence (retries, repairs, validation per generation), artifacts (path, kind, bytes, producing task, sha256), validation (with the amended tests and the bug-fix proof when present), risks and trade-offs, approvals, assumptions and limits. It is a pure function of the blackboard, tasks, events, gates and manifest, so it cannot disagree with the run.
-
----
-
-
-## 6. Requirement-by-requirement map
-
-| # | Assessment requirement | How it is met | Where | Evidence you can show |
-|---|---|---|---|---|
-| 1a | Interpret intent, identify ambiguities | Vague-term lexicon vs numeric targets, blocking rule, questions with defaults; a model may only ADD questions; injection screening | `steps/analysis.py` (`RequirementAnalyst`), `agents/requirement_analyst.md` | `output/ambiguous/clarifications.json` |
-| 1b | Normalise to an engineering problem | `requirement` object: problem statement, capabilities (CAP-n), NFRs, acceptance criteria (AC-n), assumptions with confidence | same | section 1 of every `ENGINEERING_SUMMARY.md` |
-| 2 | Decompose into tasks with dependencies and sequence | The lead proposes `{id, tool, title, deps}`; `check_plan` verifies tools, `needs`/`provides`, cycles, write conflicts, one validator and one summarizer | `harness/lead.py`, `harness/tools.py`, `agents/project_lead.md` | `output/*/plan.json`, the wave table and graph in the summary |
-| 3 | Codebase reasoning (brownfield) | AST model: modules, import graph, routes, SQL tables, receiver-aware call graph, flows, two-tier impact; baseline suite run before anything is touched | `steps/analysis.py` (`CodebaseAnalyst`) | summary section 2 of any brownfield run |
-| 4a | Sequencing and dependency management | A task starts only when its `needs` are provided and its dependencies succeeded; the lead picks among ready tasks within the worker limit | `harness/loop.py` | wave table; max concurrency in the summary |
-| 4b | Cross-step coordination, not just sequential | Facts on a blackboard; the spec tester waits for the contract the code author publishes (never its code); validator findings blame a ROLE and the harness maps it to the lead's tasks | `harness/core.py`, `harness/loop.py` | repair rounds in the validation-by-generation table |
-| 4c | Error handling and recovery | Error taxonomy: retry with backoff, self-correct, repair loop, skip, degrade, resume, lead fallback, human veto | `harness/core.py`, `loop.py`, `harness.py` | `--inject` flags; `output/greenfield_chaos/` |
-| 5 | Production-quality code, contracts, tests, docs | The model writes the service and a spec-only test suite; the design steps fix the contract (OpenAPI), schema, ADRs; docs are written by a step | `authoring_agents.py`, `steps/design.py`, `steps/build.py` | `output/greenfield/release/` |
-| 6a | Risks, trade-offs, failure scenarios | Risk catalogue with likelihood/impact/mitigation; ADRs with options and trade-offs | `knowledge.py`, `steps/design.py` | summary section 7 |
-| 6b | Validation approach | A strategy is derived from the risks before tests exist; the validator executes it | `steps/design.py` (`ValidationStrategist`), `steps/validate.py` | summary section 6 |
-| 6c | Guardrails | Path jail, write scopes, extension allow-list, secret scan, size caps, isolated test runner, bounded loops, original repo never modified, **existing tests protected** | `harness/guardrails.py` | `tests/test_guardrails.py`, `tests/test_test_policy.py` |
-| 7 | Controlled autonomy | Agents run freely between gates; three human gates (plan, test update, release); every decision audited | `harness/approvals.py`, `harness/harness.py` | `--approve interactive`, `reject:<gate>` |
-| 8 | Structured engineering summary | Plan and rationale, artifacts (producer, sha256), validation, risks, approvals, assumptions, limits | `harness/report.py` | `output/*/ENGINEERING_SUMMARY.md` |
-| D1 | Working prototype incl. URL shortener | `python run.py greenfield` | `run.py` | the released, running service |
-| D3 | Example scenarios | greenfield, brownfield (bug fix, enhancement), ambiguous | [usecases/](usecases/), `output/` | `python scripts/verify_outputs.py` |
-
----
-
-
-## 7. How the pieces demonstrate each controlled-autonomy claim
-
-| Claim | Demonstration |
-|---|---|
-| Agents work independently across steps | 10 tasks in waves, parallel where dependencies allow, no human input between gates |
-| Humans oversee | three gates; interactive mode; veto at any gate; amended tests need approval; approval audit table |
-| Autonomy is bounded | bounded plan tries, lead turns, attempts and repair rounds; write scopes; sandbox; timeouts |
-| Agents cannot grade their own work | the validator is code; tests come from a separate call; the author cannot edit the tests that judge it; the bug fix must fail on the old code |
-| Failures are visible and recoverable | `--inject transient|defect|fatal`, `--resume`, the "Orchestration evidence" section |
-| Nothing ships unreviewed | `release/` exists only after the release gate |
-
----
-
-
-## 8. Key decisions and why
-
-| Decision | Justification | Cost / trade-off |
-|---|---|---|
-| Model plans, harness checks | Real decomposition without trusting the model with permissions | A bad plan costs a retry; runs are no longer reproducible end to end |
-| Rules live in a data catalog | A reviewer can read what each tool may do; a prompt cannot override it | Catalog must be kept in step with the steps (a test enforces it) |
-| Validator blames **roles**, not task ids | The lead chooses ids, so ids cannot be hard-coded | One more concept to learn |
-| Tests written from the spec, never from the code | An independent oracle; the author cannot grade its own work | Needs a good contract |
-| Deterministic steps around the models | The models plan, write code and write tests; design, validation and the sandbox stay deterministic and testable | An offline reference generator exists for the test suite only |
-| Human gates for the plan, any amended test, and the release; no auto-release | The irreversible or trust-changing steps stay with a person | Slower than full automation |
-| Existing tests are protected; one narrow, counted, human-approved exception | An author must not edit its own judge, yet a contract change can make a test obsolete | A textual count cannot judge a subtly wrong new expected value, so the human gate is the backstop |
-| Bounded everything (plan tries, lead turns, repairs, attempts) | The loop always terminates, cost is capped | A hard case ends as `failed`, not "keep trying" |
-| Lead falls back to "start all ready" after two bad answers | A formatting slip must not kill a run; logged, visible in the audit trail | The fallback is deterministic, not intelligent |
-
-
-## 9. Model providers and the Azure deployment
-
-`agentic/providers.py` gives the harness one contract, `complete_json(system, prompt)`, with four backends chosen in `.env`: `azure`, `openai` (any OpenAI-compatible API), `anthropic`, `command` (a CLI over stdin and stdout). No agent file names a vendor (a test enforces it). `python scripts/model_smoke.py` checks the connection first.
-
-The model is a **producer**: its reply is parsed defensively, path-filtered, size-capped and syntax-checked, and every file goes through the sandbox.
-
-| Failure | Where it is caught | Response |
-|---|---|---|
-| not JSON, fenced, prose around it | tolerant extractor | the task fails clearly |
-| truncated, 429, 5xx, network | provider | transient: retry with backoff |
-| 401, 403, 404 | provider | permanent, with a hint (key, role, deployment) |
-| wrong shape, forbidden path, syntax error, missing interface, tests below the minimum | the agent's pre-checks | the same task retries with the exact problems quoted back |
-| an edit whose `find` matches 0 or 2+ times | the change proposer | rejected with feedback, never guessed |
-| an amendment that removes, weakens or skips a test | the amendment check | rejected with feedback |
-| behavioural bug or failing tests | the validator | repair loop with the failing output quoted back |
-| path escape, embedded secret | `Workspace` | `GuardrailViolation`, never retried |
-
-`agentic/api.py` and `infra/` deploy the harness to Azure Container Apps with a managed identity and **remote approval gates** (see [AZURE_DEPLOYMENT.md](AZURE_DEPLOYMENT.md)). Honest limits: one replica (state and pending gates are in memory), ephemeral `/data`, a shared bearer token, and the validator subprocess shares the container.
-
----
-
-
-## 10. Honest limitations and roadmap (say these before they ask)
-
-1. **Not reproducible end to end.** Models write the plan, the code and the tests, so two runs can pick different task shapes and need a different number of repair rounds. The steps around them are deterministic. Mitigations to name: record the plan (`plan.json`), pin the deployment, and replay a stored plan.
-2. **Only one provider has run live.** Azure (one Foundry deployment, key auth). `openai`, `anthropic` and `command` are tested for wire format with mocked HTTP only. Different models plan with different quality; the plan check protects the run, but a weaker model may need more attempts.
-3. **The Azure Container Apps deployment has not been tried.** The API and Bicep are tested only against a local server.
-4. **Documentation improvements produce a change record**, not rewritten prose.
-5. **Static analysis is heuristic:** decorator routes and SQL in string literals only. It is blind to other styles, which is why the code author is then shown every module.
-6. **Ambiguity detection is lexical.** It misses ambiguity expressed without a known vague word.
-7. **The validator proves "consistent and tested", not "right for the business".** It cannot know whether 302 versus 301 was the right call; that is what the ADRs and the gates are for.
-8. **Subprocess isolation is not a container.** It limits time, environment and import path; a hostile generated test could still use the network or disk.
-9. **Prototype storage and rate limiting are single-node** (SQLite single writer; per-node token bucket; an in-process cache can serve a deleted link for up to its TTL).
-10. **The amendment check counts; it does not understand.** It stops deleting a test, dropping an assertion, skipping a test and breaking syntax. It does not stop a rewrite that keeps the same number of assertions but compares less (a live amendment made the contract comparison ignore `description` and `summary` fields) or a subtly wrong new expected value. That is what the human `test_update_approval` gate is for: read the diff.
-11. **`auto` approval is a policy, not a reviewer.** It exists so CI and the demo run unattended.
-
-### Roadmap (in order)
-
-1. An eval harness: golden requirements, first-pass validation rate, repair rounds and cost per run, to compare models and prompts.
-2. A container sandbox with no network or identity for test execution; signed artifacts.
-3. A durable workflow engine (Temporal) once there are many users and approvals can wait days.
-4. A documentation-writing agent.
-5. Plan replay and model pinning for reproducibility.
-
----
-
+| Interpret intent, find ambiguity, restate as an engineering problem | `steps/analysis.py` (`RequirementAnalyst`); `output/*/ENGINEERING_SUMMARY.md` section 1; the ambiguous use case |
+| Decompose into tasks with dependencies and an order | `harness/lead.py`, `harness/tools.py`; `plan.json` and the wave table in the summary |
+| Reason about existing code | `steps/analysis.py` (`CodebaseAnalyst`); summary section 2 of any brownfield run |
+| Orchestration: parallelism, coordination, error handling and recovery | `harness/loop.py`; retries, repair rounds and `--inject` fault injection (tests in `tests/test_e2e.py`, `tests/test_loop.py`) |
+| Code, API contracts, tests, docs | `output/greenfield/release/` |
+| Risks, trade-offs, validation strategy, guardrails | `release/docs/RISKS.md` and `ADR.md`; summary sections 6 and 7; `harness/guardrails.py` |
+| Controlled autonomy | three human gates, interactive mode, `reject:<gate>`, the approval audit in the summary |
+| A final structured engineering summary | `harness/report.py` and `ENGINEERING_SUMMARY.md` in every run |
+
+Controlled autonomy in one line: agents run freely and in parallel between gates; they cannot approve anything, widen a permission, edit the tests that judge them, or release.
+
+## 12. Limits and roadmap (say these before anyone asks)
+
+1. **Not reproducible end to end.** Models write the plan, the code and the tests, so two runs can differ and need a different number of repairs. Mitigation: `plan.json` is recorded.
+2. **Only one provider has run live**: Azure. `openai`, `anthropic` and `command` are tested for wire format with mocked HTTP only.
+3. **The Azure Container Apps deployment has not been tried.**
+4. **A run can still fail.** If the model's output is rejected after the bounded retries, the status is `failed` and nothing is released. Re-running often passes.
+5. **The validator proves "consistent and tested", not "right for the business".**
+6. **Static analysis is heuristic** (decorator routes and SQL string literals only), and **ambiguity detection is lexical**.
+7. **Subprocess isolation is not a container**: a hostile generated test could still use the network or disk.
+8. **The generated service is a prototype**: SQLite single writer, an in-process cache, a per-node rate limiter.
+9. **The amendment check counts; it does not understand.** The human gate is the backstop.
+10. **`auto` approval is a policy, not a reviewer.**
+11. **A `--shorten` short URL is ephemeral.** It runs from a temporary copy on `127.0.0.1` with a throwaway database, so it works only while that process runs. Every `--shorten` run rebuilds the service (about 9 minutes).
+12. Documentation changes produce a change record, not rewritten prose.
+
+**Roadmap:** an eval harness (golden requirements, first-pass rate, cost per run); a container sandbox with no network or identity; a durable workflow engine for long-lived approvals; a documentation-writing agent; plan replay and model pinning.

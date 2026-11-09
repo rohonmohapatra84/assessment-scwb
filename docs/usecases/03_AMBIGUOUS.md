@@ -1,7 +1,7 @@
 # Use case 3: Ambiguous requirement. "Make the link service faster and more secure."
 
-**Read this first if you are new.** Shared vocabulary is in [../ARCHITECTURE.md](../ARCHITECTURE.md); run and check commands are in
-[../HOW_TO_RUN_AND_VERIFY.md](../HOW_TO_RUN_AND_VERIFY.md). The other use cases: [01_GREENFIELD.md](01_GREENFIELD.md), [02_BROWNFIELD.md](02_BROWNFIELD.md).
+**Read this first if you are new.** Shared vocabulary is in [../ARCHITECTURE.md](../ARCHITECTURE.md); the run and check commands are in the [root README](../../README.md#5-prerequisites-and-quick-start)
+(Use case 3). The other use cases: [01_GREENFIELD.md](01_GREENFIELD.md), [02_BROWNFIELD.md](02_BROWNFIELD.md).
 
 The point of this use case: **the system must not guess.** "Faster" and "more secure" have no number and no scope. A system that builds something anyway has invented the requirement.
 So it stops, asks, and only then produces a decision-ready proposal, not code.

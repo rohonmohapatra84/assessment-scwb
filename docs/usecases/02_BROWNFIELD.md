@@ -1,7 +1,7 @@
 # Use case 2: Brownfield. Changing code that already exists
 
-**Read this first if you are new.** Shared vocabulary is in [../ARCHITECTURE.md](../ARCHITECTURE.md); run and check commands are in
-[../HOW_TO_RUN_AND_VERIFY.md](../HOW_TO_RUN_AND_VERIFY.md). Greenfield is [01_GREENFIELD.md](01_GREENFIELD.md).
+**Read this first if you are new.** Shared vocabulary is in [../ARCHITECTURE.md](../ARCHITECTURE.md); how to plant a bug yourself and run the fix is in the [root README](../../README.md#5-prerequisites-and-quick-start);
+the advanced kinds of change are in [../HOW_TO_RUN_AND_VERIFY.md](../HOW_TO_RUN_AND_VERIFY.md). Greenfield is [01_GREENFIELD.md](01_GREENFIELD.md).
 
 ## Input and output of this use case
 
@@ -19,12 +19,12 @@ Greenfield (use case 1) **built** the URL shortener. Brownfield is the next chap
 It might be a defect they noticed, a new feature, a tidy-up, or missing tests. The system's job is to change *existing* code safely, which is harder than writing new code, because the
 change must not break anything that already works.
 
-**A person reports the problem; the agents do not discover it.** The agents never go looking for bugs. In the bug-fix demo:
+**A person reports the problem; the agents do not discover it.** The agents never go looking for bugs. In the bug-fix test:
 
 | Who | Does what |
 |---|---|
-| **The demo script** | copies the shortener and **plants one realistic bug** in the copy (the stats query counts every click as a unique visitor), so there is a real defect to fix |
-| **You (the person)** | report it in plain English: *"Fix the bug where link stats report unique_visitors equal to the total number of clicks."* That sentence is the requirement |
+| **You** (or, with no effort, the demo script) | copy the shortener and **plant one realistic bug** in the copy: by hand, using one of the five ready-made bugs in [`input/brownfield/bugs/`](../../input/brownfield/bugs/), or let `python run.py brownfield` plant the built-in one (the stats query counts every click as a unique visitor) |
+| **You (the person)** | report it in plain English, for example *"Fix the bug where link stats report unique_visitors equal to the total number of clicks."* That sentence is the requirement |
 | **The agents** | work out **where** in the existing code that behaviour lives (route, call chain, table: the "codebase reasoning"), make the smallest change that fixes it, and write tests |
 | **The validator** | proves it: the old tests were red, they are green now, and the **new tests fail on the buggy code** (so they really catch this bug) |
 | **A human** | approves the plan and the release |
@@ -36,7 +36,7 @@ The change types below are the same idea with different proof.
 
 | Kind | Level | Example request | Command | Output folder |
 |---|---|---|---|---|
-| **bug fix** | **Your first brownfield test** | "Fix the bug where link stats report `unique_visitors` equal to the total number of clicks" | `python run.py brownfield --verify` (plants the bug, fixes it, verifies: one command) | `output/brownfield/` |
+| **bug fix** | **Your first brownfield test** | "Fix the bug where link stats report `unique_visitors` equal to the total number of clicks" | plant your own bug, then `python run.py brownfield --repo <your copy> --requirement-file <bug report> --out output/my_bug1 --verify` (see the README); or `python run.py brownfield --verify` to plant the built-in bug for you | `output/brownfield/` (or your `--out`) |
 | **enhancement** (changes the API) | *Advanced. Can fail.* | "Add support for expiring short links ... return 410 Gone" | `python run.py enhancement` | `output/enhancement/` |
 | **refactor** | *Advanced* | "Refactor the stats query code in storage into small helpers, without changing behaviour" | `python run.py refactor --verify` (input: `input/refactor/requirement.txt`) | `output/refactor/` |
 | **tests / docs** | *Advanced* | "Improve test coverage for link deletion and alias validation" | `python run.py tests --verify` (input: `input/tests_improvement/requirement.txt`) | `output/tests_improvement/` |
@@ -126,17 +126,9 @@ sequenceDiagram
 
 ## 3. The two policies that keep the tests honest
 
-The model writes both the code and the tests, so neither may quietly weaken the other.
-
-**Approved test updates.** An agent never edits a test it did not write, except: an **enhancement**, whose OpenAPI contract really changed, where **only `spec_tester`**, **only after a validation failure** showed an existing test failing,
-may propose an anchored edit with a reason. It is accepted only if a count check passes (no test removed, no assertion lost, nothing skipped, valid Python, at most five edits), through the one door
-`Workspace.write_test_update` (an existing baseline `tests/test_*.py` only). The validator then compares **every baseline test on disk to the pristine copy** (`tests.existing_tests_protected`), so writing around the API still fails,
-and a human sees each diff at the `test_update_approval` gate.
-*Honest limit:* the check counts, it does not understand. A live amendment kept the assertion count but made the contract comparison ignore `description` and `summary`; only the human gate catches that. Read the diff.
-
-**Bug-fix proof.** A regression test only counts if it fails on the bug. The validator copies the baseline to a temporary folder, adds the new tests, and runs them: at least one must fail **by assertion** (an import error does not count),
-then all must pass on the fix (`regression.fails_on_old_code`). Live: 10 new tests failed on the buggy code and passed on the fix.
-
+The model writes both the code and the tests, so neither may quietly weaken the other. The two policies, **approved test updates** (the one narrow, counted, human-approved exception to "an agent never edits a test it did not write") and the **bug-fix proof**
+(a regression test only counts if it fails on the bug), are explained in [../ARCHITECTURE.md](../ARCHITECTURE.md), section 6, and the test that proves each rule is mapped in [../TESTING.md](../TESTING.md).
+Live: 10 new tests failed on the buggy code and passed on the fix. The honest limit stands: the amendment check counts, it does not understand, so the human gate is the backstop; read the diff.
 ## 4. Test cases: what is checked, per kind
 
 | Check | bug fix | enhancement | refactor | tests / docs |
@@ -159,7 +151,7 @@ and deleting a protected test counts; amendments may not remove, weaken or skip;
 rejecting the gate blocks the release; with no amendment path the obsolete test makes the run fail; a regression test that passes on the old code, or cannot load on it, is refused; a really seeded bug is fixed end to end;
 the original repository is never modified; anchor drift fails safe and is never retried.
 
-**Check it yourself:** `python scripts/verify_outputs.py brownfield enhancement`; for the bug fix, `cd output/brownfield/input/existing_code_with_bug` and run the tests (red), then `cd ../../release` (green). Or simply run `python run.py brownfield --verify`.
+**Check it yourself:** `python scripts/verify_outputs.py brownfield enhancement`; for the bug fix, run the tests in your broken copy (red) and in `output/<your out>/release` (green). Or simply run `python run.py brownfield --verify`.
 
 ## 5. Decisions and why
 
@@ -188,4 +180,4 @@ files, the service interface withheld from the test author, and finally a baseli
 ## 7. Limits
 
 An enhancement can still need extra repair rounds or occasionally fail with a real model. The amendment check counts and does not understand (see section 3). A bug fix's proof needs at least one new test that fails by assertion.
-Documentation changes produce a change record, not rewritten prose. Only the `azure` provider has run live.
+Documentation changes produce a change record, not rewritten prose. Only the `azure` provider has run live. The general limits are in [../ARCHITECTURE.md](../ARCHITECTURE.md), section 12.
