@@ -211,8 +211,18 @@ class LLMGreenfieldTests(unittest.TestCase):
             files["shortener/config.py"] += '\nAPI_KEY = "abcd1234efgh5678ijkl"\n'
         r = quiet(self.out, ScriptedLLM(code_mutations=[leak] * 6)).run(GREENFIELD)
         self.assertEqual(r.status, "failed")
-        summary = json.loads((self.out / "summary.json").read_text())
-        self.assertIn("secret", next(t for t in summary["tasks"] if t["id"] == "gen_code")["error"])
+        events = (self.out / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn("secret-like", events)  # the model was told what to fix on every attempt, then the task gave up
+        self.assertNotIn("abcd1234efgh5678ijkl", "".join(p.read_text(encoding="utf-8", errors="ignore")
+                                                          for p in (self.out / "workspace").rglob("*.py")))  # and nothing leaked into the workspace
+
+    def test_a_secret_the_model_fixes_on_retry_does_not_fail_the_run(self):
+        """A one-off leak is feedback, not a crash: the model corrects it and the run completes."""
+        def leak(files):
+            files["shortener/config.py"] += '\nAPI_KEY = "abcd1234efgh5678ijkl"\n'
+        r = quiet(self.out, ScriptedLLM(code_mutations=[leak])).run(GREENFIELD)
+        self.assertNotEqual(r.status, "failed")
+        self.assertIn("task_self_correct", (self.out / "events.jsonl").read_text(encoding="utf-8"))
 
 
 class LLMBrownfieldTests(unittest.TestCase):

@@ -168,7 +168,7 @@ def test_inventory(ws) -> Dict[str, Any]:
         stems.add(stem)
         try:
             tree = ast.parse(ws.read(rel))
-        except SyntaxError:
+        except (SyntaxError, ValueError):
             continue
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
@@ -249,8 +249,8 @@ class Validator:
             if rel.endswith(".py"):
                 try:
                     ast.parse(text)
-                except SyntaxError as exc:
-                    bad_syntax.append(f"{rel}:{exc.lineno}")
+                except (SyntaxError, ValueError) as exc:
+                    bad_syntax.append(f"{rel}:{getattr(exc, 'lineno', '?')}")
             if scan_for_secrets(text):
                 secrets.append(rel)
         n = len(ctx.ws.list_files(".py"))

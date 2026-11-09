@@ -1,4 +1,4 @@
-"""Tests for the analysis/design agents and the pure helper logic (no pipeline run)."""
+﻿"""Tests for the analysis/design agents and the pure helper logic (no pipeline run)."""
 import tempfile
 import unittest
 from pathlib import Path
@@ -150,3 +150,56 @@ class CodebaseAnalystTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class NullByteModelOutputTests(unittest.TestCase):
+    """A model reply containing a NUL character must be REJECTED with feedback (so the agent retries), never crash the task.
+    Python < 3.12 raises ValueError ("source code string cannot contain null bytes") from ast.parse, not SyntaxError."""
+
+    def test_a_null_byte_in_generated_code_is_a_validation_failure_not_a_crash(self):
+        from agentic.authoring_agents import _validate_files
+        from agentic.harness.core import ValidationFailure
+        for content in ("x = 1\x00\n", "def f():\n    return 1\x00"):
+            with self.assertRaises(ValidationFailure) as cm:
+                _validate_files([{"path": "shortener/a.py", "content": content}], r"shortener/[A-Za-z0-9_]+\.py", "service")
+            self.assertIn("null byte", " ".join(f["message"] for f in cm.exception.findings).lower())  # the feedback the model sees on retry
+
+    def test_a_null_byte_in_a_non_python_file_is_also_rejected(self):
+        from agentic.authoring_agents import _validate_files
+        from agentic.harness.core import ValidationFailure
+        with self.assertRaises(ValidationFailure):
+            _validate_files([{"path": "shortener/a.py", "content": "x = 1\n"}, {"path": "shortener/b.py", "content": "y\x00"}],
+                            r"shortener/[A-Za-z0-9_]+\.py", "service")
+
+    def test_the_amendment_check_and_codebase_analysis_survive_a_null_byte(self):
+        from agentic.harness.guardrails import check_test_amendment
+        self.assertTrue(check_test_amendment("def test_a(self):\n    assert 1\n", "def test_a(self):\n    assert 1\x00\n", "tests/t.py"))
+        self.assertEqual(CodebaseAnalyst._sql_tables("SELECT 1\x00"), [])
+
+class SecretLikeModelOutputTests(unittest.TestCase):
+    """The sandbox refuses to WRITE secret-like text. A model reply containing it must be sent back as feedback (retry),
+    not allowed to reach the write and kill the task with a GuardrailViolation."""
+
+    def test_secret_like_text_in_generated_code_is_feedback_not_a_crash(self):
+        from agentic.authoring_agents import _validate_files
+        from agentic.harness.core import ValidationFailure
+        for line in ('token = "abcdefgh12345"', "API_KEY = 'not-a-real-key-123'", 'password = "hunter2hunter2"'):
+            with self.assertRaises(ValidationFailure) as cm:
+                _validate_files([{"path": "shortener/tests.py", "content": f"{line}\n"}], r"shortener/[A-Za-z0-9_]+\.py", "code")
+            message = " ".join(f["message"] for f in cm.exception.findings)
+            self.assertIn("secret-like", message)
+            self.assertIn("shortener/tests.py", message)  # the model is told which file to fix
+
+    def test_short_placeholders_and_ordinary_names_are_still_accepted(self):
+        from agentic.authoring_agents import _validate_files
+        ok = _validate_files([{"path": "shortener/a.py", "content": 'token = "abc"\ncode = "abcdefgh12345"\n'}],
+                             r"shortener/[A-Za-z0-9_]+\.py", "code")
+        self.assertEqual([p for p, _ in ok], ["shortener/a.py"])
+
+    def test_the_sandbox_still_refuses_to_write_a_secret(self):
+        """Defence in depth: the pre-check is feedback; the write guard stays the hard stop."""
+        from agentic.harness.core import GuardrailViolation
+        with tempfile.TemporaryDirectory() as d:
+            ws = Workspace(Path(d))
+            with self.assertRaises(GuardrailViolation):
+                ws.write("shortener/a.py", 'token = "abcdefgh12345"\n', kind="code", producer="t")
+

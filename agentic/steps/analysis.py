@@ -284,7 +284,7 @@ class CodebaseAnalyst:
             src = path.read_text(encoding="utf-8")
             try:
                 tree = ast.parse(src)
-            except SyntaxError:
+            except (SyntaxError, ValueError):
                 continue
             info = {"path": rel, "loc": src.count("\n") + 1, "imports": [], "classes": [], "functions": [],
                     "sql": sorted(set(self._sql_tables(src)))}
@@ -358,7 +358,7 @@ class CodebaseAnalyst:
         """Module-level summary of tables mentioned in SQL string literals."""
         try:
             strings = [n.value for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-        except SyntaxError:
+        except (SyntaxError, ValueError):
             return []
         reads, writes = cls._sql_access(strings)
         return sorted(reads | writes)

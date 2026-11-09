@@ -45,8 +45,8 @@ def check_test_amendment(old: str, new: str, path: str) -> List[str]:
     import ast
     try:
         ast.parse(new)
-    except SyntaxError as exc:
-        return [f"{path}: amended test has SyntaxError line {exc.lineno}: {exc.msg}"]
+    except (SyntaxError, ValueError) as exc:
+        return [f"{path}: amended test has SyntaxError line {getattr(exc, 'lineno', '?')}: {getattr(exc, 'msg', exc)}"]
     problems: List[str] = []
     tests = lambda s: set(re.findall(r"def\s+(test_\w+)\s*\(", s))
     asserts = lambda s: len(re.findall(r"\bassert\w*\b", s))

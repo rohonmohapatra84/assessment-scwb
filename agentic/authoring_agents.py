@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Tuple
 
 from .agent_specs import load_context, load_spec
 from .harness.core import FatalError, TransientError, ValidationFailure
-from .harness.guardrails import check_test_amendment
+from .harness.guardrails import check_test_amendment, scan_for_secrets
 from .providers import LLMTransient, LLMUnavailable
 from .steps.build import _params, render, template_files
 
@@ -97,6 +97,17 @@ def _feedback_block(ctx, current_files: Dict[str, str] = None) -> str:
     return block
 
 
+def _secret_problem(path: str, content: str) -> str:
+    """The same scan the sandbox applies on write, run BEFORE writing so the model gets feedback and retries
+    instead of the task dying on a GuardrailViolation. Returns '' when clean."""
+    leaks = scan_for_secrets(content)
+    if not leaks:
+        return ""
+    return (f"{path}: contains secret-like text ({', '.join(leaks)}). Never write credentials. The scan flags a quoted value of 8 or more "
+            f"characters assigned to a name containing password, secret, api_key or token (e.g. token = \"abcdefgh12\"). "
+            f"Rename that variable (for example 'code' or 'value') or use a short placeholder under 8 characters")
+
+
 def _validate_files(raw: Any, path_re: str, label: str) -> List[Tuple[str, str]]:
     problems: List[str] = []
     if not isinstance(raw, list) or not raw:
@@ -112,12 +123,17 @@ def _validate_files(raw: Any, path_re: str, label: str) -> List[Tuple[str, str]]
             problems.append(f"path {path!r} not allowed (must match {path_re})")
         elif len(content) > MAX_FILE_CHARS:
             problems.append(f"{path} exceeds {MAX_FILE_CHARS} characters")
+        elif "\x00" in content:
+            problems.append(f"{path}: contains a null byte (\\x00). Return plain text only, with no NUL characters")
         else:
             if path.endswith(".py"):
                 try:
                     ast.parse(content)
-                except SyntaxError as exc:
-                    problems.append(f"{path}: SyntaxError line {exc.lineno}: {exc.msg}")
+                except (SyntaxError, ValueError) as exc:  # Python < 3.12 raises ValueError, not SyntaxError, for source it cannot read
+                    problems.append(f"{path}: SyntaxError line {getattr(exc, 'lineno', '?')}: {getattr(exc, 'msg', exc)}")
+            secret = _secret_problem(path, content)
+            if secret:
+                problems.append(secret)
             out.append((path, content))
     if len(raw) > MAX_FILES:
         problems.append(f"too many files (max {MAX_FILES})")
@@ -292,11 +308,14 @@ class _ChangeProposer:
                      if raw.get("new_files") else [])
         new_files = [(p, c) for p, c in new_files if p not in contents]  # never silently overwrite an existing module
         for p, c in contents.items():
+            secret = _secret_problem(p, c)
+            if secret:
+                problems.append(secret)
             if p.endswith(".py"):
                 try:
                     ast.parse(c)
-                except SyntaxError as exc:
-                    problems.append(f"{p}: result has SyntaxError line {exc.lineno}: {exc.msg}")
+                except (SyntaxError, ValueError) as exc:
+                    problems.append(f"{p}: result has SyntaxError line {getattr(exc, 'lineno', '?')}: {getattr(exc, 'msg', exc)}")
             if p.endswith(".json"):
                 try:
                     json.loads(c)
